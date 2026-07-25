@@ -123,6 +123,8 @@ func normalizeDecision(s string) Decision {
 		return DecisionValidate
 	case "CONTINUE":
 		return DecisionContinue
+	case "COMPLETE":
+		return DecisionComplete
 	case "RETRY_CLEAN", "RETRY":
 		return DecisionRetryClean
 	case "REPLACE":

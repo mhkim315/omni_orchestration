@@ -24,6 +24,7 @@ type Decision string
 const (
 	DecisionValidate   Decision = "VALIDATE"
 	DecisionContinue   Decision = "CONTINUE"
+	DecisionComplete   Decision = "COMPLETE"
 	DecisionRetryClean Decision = "RETRY_CLEAN"
 	DecisionReplace    Decision = "REPLACE"
 	DecisionFail       Decision = "FAIL"

@@ -1,34 +1,43 @@
-// Package orchestrator integrates worktree, runtime, supervisor, and taskstore
-// into a coordinated task-execution loop with decision gateway, auto-wake,
-// and worker re-instruction.
+// Package orchestrator integrates worktree, runtime, supervisor, taskstore,
+// and coordinator into a coordinated task-execution loop.
 //
-// B2: Decision gateway with state validation, idempotency, generation checks.
-// B3: Auto-wake events with idempotency keys and ACK tracking.
-// B4: Worker re-instruction (RETRY_CLEAN, CONTINUE, REPLACE, FAIL, COMPLETE).
+// B-R1: CoordinatorRuntime.Wake() replaces emitWake/awaitDecision.
+// Decision type imported from coordinator package. All wake paths
+// go through the coordinator contract.
 package orchestrator
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"log"
-	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/miinanii/omni_orchestration/internal/coordinator"
 	"github.com/miinanii/omni_orchestration/internal/runtime"
 	"github.com/miinanii/omni_orchestration/internal/supervisor"
 	"github.com/miinanii/omni_orchestration/internal/taskstore"
 	"github.com/miinanii/omni_orchestration/internal/worktree"
 )
 
+// Re-export coordinator types so existing callers don't break.
+type Decision = coordinator.Decision
+type WakePacket = coordinator.WakePacket
+type WakeResponse = coordinator.WakeResponse
+
+const (
+	DecisionStart      = coordinator.DecisionValidate // initial → START is VALIDATE
+	DecisionValidate   = coordinator.DecisionValidate
+	DecisionComplete   = coordinator.DecisionComplete
+	DecisionContinue   = coordinator.DecisionContinue
+	DecisionRetryClean = coordinator.DecisionRetryClean
+	DecisionReplace    = coordinator.DecisionReplace
+	DecisionFail       = coordinator.DecisionFail
+)
+
 const defaultMaxAttempts = 3
-const continueLeaseTimeout = 30 * time.Second
-const wakeAckTimeout = 60 * time.Second
 
 type Config struct {
 	Repo        string
@@ -38,34 +47,16 @@ type Config struct {
 	Validator   string
 	StorePath   string
 	MaxAttempts int
+
+	// B-R1: Coordinator runtime for LLM-driven decisions.
+	Coordinator *coordinator.CoordinatorRuntime
 }
 
-// ── Decision Gateway (B2) ──
+// ── Decision Gateway (B-R1: wraps coordinator gen checks) ──
 
-type Decision string
-
-const (
-	DecisionStart      Decision = "START"
-	DecisionValidate   Decision = "VALIDATE"
-	DecisionComplete   Decision = "COMPLETE"
-	DecisionContinue   Decision = "CONTINUE"
-	DecisionRetryClean Decision = "RETRY_CLEAN"
-	DecisionReplace    Decision = "REPLACE"
-	DecisionFail       Decision = "FAIL"
-)
-
-// allowedTransitions maps each state to allowed coordinator decisions.
-var allowedTransitions = map[supervisor.State][]Decision{
-	supervisor.StateActive:             {DecisionStart, DecisionFail},
-	supervisor.StateQuiescentCandidate: {DecisionValidate, DecisionContinue, DecisionRetryClean, DecisionReplace, DecisionFail},
-	supervisor.StateExited:             {DecisionValidate, DecisionComplete, DecisionRetryClean, DecisionFail},
-	supervisor.StateCrashed:            {DecisionRetryClean, DecisionFail},
-}
-
-// DecisionGateway validates coordinator decisions against state + rules.
 type DecisionGateway struct {
 	coordGen   int64
-	seenEvents map[string]bool // idempotency keys
+	seenEvents map[string]bool
 	mu         sync.Mutex
 }
 
@@ -73,36 +64,17 @@ func NewDecisionGateway() *DecisionGateway {
 	return &DecisionGateway{seenEvents: make(map[string]bool)}
 }
 
-// B2: Validate checks decision against state. Returns error if invalid.
-func (g *DecisionGateway) Validate(state supervisor.State, decision Decision, hasValidator, validatorPassed bool) error {
+func (g *DecisionGateway) Validate(state supervisor.State, decision Decision, validatorPassed bool) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	allowed, ok := allowedTransitions[state]
-	if !ok {
-		return fmt.Errorf("unknown state %s", state)
-	}
-	valid := false
-	for _, d := range allowed {
-		if d == decision {
-			valid = true
-			break
-		}
-	}
-	if !valid {
-		return fmt.Errorf("decision %q not allowed in state %s (allowed: %v)", decision, state, allowed)
-	}
-
-	// B2: COMPLETE requires validator ACCEPT.
 	if decision == DecisionComplete && !validatorPassed {
 		return fmt.Errorf("COMPLETE requires validator ACCEPT")
 	}
-
 	g.coordGen++
 	return nil
 }
 
-// B2: IsDuplicate checks the idempotency key. Returns true if already seen.
 func (g *DecisionGateway) IsDuplicate(key string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -119,30 +91,15 @@ func (g *DecisionGateway) Generation() int64 {
 	return g.coordGen
 }
 
-// ── Wake Message (B3) ──
-
-type WakeEvent struct {
-	ID        string    `json:"id"`
-	RunID     int64     `json:"run_id"`
-	TaskID    int64     `json:"task_id"`
-	AttemptID int64     `json:"attempt_id"`
-	State     string    `json:"state"`
-	Reason    string    `json:"reason"`
-	Timestamp time.Time `json:"timestamp"`
-}
-
-func (w WakeEvent) IdempotencyKey(runID int64, coordGen int64) string {
-	return fmt.Sprintf("wake:%d:%s:%d", runID, w.ID, coordGen)
-}
-
-// ── Run Context ──
+// ── Run State ──
 
 type attemptState struct {
-	info       *worktree.WorktreeInfo
-	rt         *runtime.Runtime
-	attempt    *taskstore.Attempt
-	worker     *taskstore.WorkerRecord
-	checkpoint string
+	info        *worktree.WorktreeInfo
+	rt          *runtime.Runtime
+	attempt     *taskstore.Attempt
+	worker      *taskstore.WorkerRecord
+	checkpoint  string
+	instruction string // B-R1: from coordinator next_instruction
 }
 
 type observeResult struct {
@@ -152,6 +109,7 @@ type observeResult struct {
 	decision        Decision
 	exited          bool
 	validatorPassed bool
+	exitCode        int
 }
 
 type runContext struct {
@@ -162,12 +120,11 @@ type runContext struct {
 	gateway   *DecisionGateway
 	runID     int64
 	taskID    int64
-	decisions []Decision
 	maxAtts   int
-	events    []WakeEvent // emitted wake events
+	decisions []Decision
 }
 
-// Run executes the full orchestrator flow.
+// Run executes the full orchestrator flow with coordinator-driven decisions.
 func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.Manager) ([]Decision, error) {
 	if cfg.Repo == "" || cfg.Task == "" || cfg.Command == "" {
 		return nil, fmt.Errorf("repo, task, and command are required")
@@ -178,11 +135,9 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 	}
 
 	existing, _ := store.GetActiveAttempts()
-	if len(existing) > 0 {
-		log.Printf("Gate-3 recovery: %d in-progress attempts cancelled", len(existing))
-		for _, a := range existing {
-			store.UpdateAttemptStatus(a.ID, taskstore.StatusCancelled)
-		}
+	for _, a := range existing {
+		store.UpdateAttemptStatus(a.ID, taskstore.StatusCancelled)
+		log.Printf("B-R1 recovery: cancelled in-progress attempt %d", a.ID)
 	}
 
 	run, err := store.CreateRun()
@@ -205,24 +160,27 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		maxAtts: maxAtts,
 	}
 
-	// B3: emit auto-wake — new run ready.
-	rc.emitWake("run_created", supervisor.StateActive, "Run created, awaiting coordinator")
-
-	// B4: Await START decision from coordinator.
-	// Auto-start when stdin is EOF (non-interactive mode).
-	startDecision := rc.awaitDecision()
-	if startDecision != DecisionStart {
-		startDecision = DecisionStart // default: auto-start
+	// B-R1: Wake coordinator for initial decision.
+	coordGen := rc.coordinatorGeneration()
+	startResp, err := rc.wakeCoordinator(coordGen, coordinator.WakePacket{
+		RunID: run.ID, TaskID: task.ID, TaskTitle: cfg.Task,
+		AttemptNumber: 0, AttemptStatus: "pending",
+		WorkerState: "pending", ExitCode: 0,
+		AllowedDecisions: []string{"VALIDATE", "FAIL"},
+	})
+	if err != nil {
+		log.Printf("B-R1: coordinator wake failed: %v — defaulting to VALIDATE", err)
+		startResp = coordinator.WakeResponse{Decision: DecisionValidate, Reason: "default", NextInstruction: cfg.Task}
 	}
-	rc.decisions = append(rc.decisions, startDecision)
-	if startDecision == DecisionFail {
+	rc.decisions = append(rc.decisions, startResp.Decision)
+	if startResp.Decision == DecisionFail {
 		store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
 		return rc.decisions, nil
 	}
 
 	attemptNum := 1
 	baseCommit := "HEAD"
-	nextInstruction := cfg.Task
+	nextInstruction := startResp.NextInstruction
 
 	for {
 		select {
@@ -231,11 +189,9 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		default:
 		}
 
-		// B2: retry limit exceeded → force FAIL.
 		if attemptNum > maxAtts {
 			store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
-			log.Printf("B2: max attempts (%d) exceeded → FAIL", maxAtts)
-			rc.emitWake("max_attempts", supervisor.StateCrashed, "Max attempts exceeded")
+			log.Printf("B-R1: max attempts (%d) exceeded → FAIL", maxAtts)
 			return rc.decisions, nil
 		}
 
@@ -244,36 +200,60 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 			return rc.decisions, err
 		}
 
-		// B3: auto-wake — worker started.
-		rc.emitWake("worker_started", supervisor.StateActive,
-			fmt.Sprintf("Attempt %d started", attemptNum))
-
 		result := rc.observeAndWait(ast)
 
-		// B3: auto-wake on state transition.
-		rc.emitWake("worker_"+string(result.state), result.state,
-			fmt.Sprintf("Worker reached state %s", result.state))
+		// B-R1: Wake coordinator with result.
+		coordGen = rc.coordinatorGeneration()
+		resp, err := rc.wakeCoordinator(coordGen, coordinator.WakePacket{
+			RunID: run.ID, TaskID: task.ID, TaskTitle: cfg.Task,
+			AttemptNumber: attemptNum, AttemptStatus: string(result.decision),
+			WorkerState: string(result.state), ExitCode: result.exitCode,
+			CheckpointSHA: result.checkpoint, ValidatorOutput: rc.validatorResult(result),
+			AllowedDecisions: rc.allowedDecisions(result),
+		})
+		if err != nil {
+			log.Printf("B-R1: coordinator wake failed: %v — defaulting to RETRY_CLEAN", err)
+			resp = coordinator.WakeResponse{Decision: DecisionRetryClean, Reason: "wake failed", NextInstruction: cfg.Task}
+		}
+		rc.decisions = append(rc.decisions, resp.Decision)
 
-		retry := rc.finalizeAttempt(ast, result)
-		if !retry {
+		if resp.Decision == DecisionComplete {
+			store.UpdateTaskStatus(task.ID, taskstore.StatusCompleted)
+			return rc.decisions, nil
+		}
+		if resp.Decision == DecisionFail {
+			store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
 			return rc.decisions, nil
 		}
 
+		// RETRY_CLEAN or REPLACE → new attempt.
 		attemptNum++
-		if result.decision == DecisionReplace {
+		nextInstruction = resp.NextInstruction
+		if resp.Decision == DecisionReplace {
 			baseCommit = ast.info.Branch
 		} else {
-			// B4: RETRY_CLEAN → new attempt from base.
 			baseCommit = "HEAD"
 		}
 	}
 }
 
-// createAttempt sets up worktree + runtime for one attempt.
-// B4: nextInstruction passed to worker stdin.
+func (rc *runContext) coordinatorGeneration() int64 {
+	if rc.cfg.Coordinator != nil {
+		return rc.cfg.Coordinator.Generation()
+	}
+	return rc.gateway.Generation()
+}
+
+func (rc *runContext) wakeCoordinator(gen int64, pkt coordinator.WakePacket) (coordinator.WakeResponse, error) {
+	if rc.cfg.Coordinator != nil {
+		return rc.cfg.Coordinator.Wake(rc.ctx, gen, pkt)
+	}
+	// No coordinator → auto-VALIDATE.
+	return coordinator.WakeResponse{Decision: DecisionValidate, Reason: "no coordinator", NextInstruction: rc.cfg.Task}, nil
+}
+
 func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instruction string) (*attemptState, error) {
 	attemptID := fmt.Sprintf("T%d-A%d", taskID, num)
-
 	info, err := rc.wt.Create(rc.cfg.Repo, fmt.Sprintf("T%d", taskID), fmt.Sprintf("%d", num))
 	if err != nil {
 		return nil, fmt.Errorf("create worktree: %w", err)
@@ -282,7 +262,6 @@ func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instructi
 	if cwd == "" {
 		cwd = info.Path
 	}
-
 	attempt, err := rc.store.CreateAttempt(taskID, num, attemptID, info.Branch, baseCommit)
 	if err != nil {
 		rc.wt.Remove(info.Path)
@@ -298,311 +277,141 @@ func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instructi
 	if err := rt.Start(rc.cfg.Command, cwd); err != nil {
 		rc.store.EmitEvent(rc.runID, taskID, attempt.ID, worker.ID, "start_failed", nil)
 		rc.wt.Remove(info.Path)
-		return nil, fmt.Errorf("start runtime: %w", err)
-	}
-	rc.store.EmitEvent(rc.runID, taskID, attempt.ID, worker.ID, "worker_started", nil)
-
-	// B4: deliver next instruction to worker stdin.
-	if instruction != "" {
-		rt.Write(1, []byte(instruction+"\n"))
+		return nil, fmt.Errorf("start worker: %w", err)
 	}
 
-	return &attemptState{info: info, rt: rt, attempt: attempt, worker: worker}, nil
+	// B-R1: Write coordinator instruction to worker stdin.
+	if instruction != "" && instruction != rc.cfg.Task {
+		rt.Write(rt.Generation(), []byte(instruction+"\n"))
+	}
+
+	return &attemptState{
+		info: info, rt: rt, attempt: attempt, worker: worker,
+		instruction: instruction,
+	}, nil
 }
 
-// observeAndWait watches the runtime until a decision point.
 func (rc *runContext) observeAndWait(ast *attemptState) observeResult {
-	supCfg := supervisor.DefaultConfig()
-	supCfg.QuiescenceTimeout = 10 * time.Second
-	supCfg.PollInterval = 2 * time.Second
-	sup := supervisor.New(supCfg)
-	stateCh := sup.Observe(rc.ctx, ast.rt)
+	// Start supervisor.
+	cfg := supervisor.Config{QuiescenceTimeout: 30 * time.Second, PollInterval: 5 * time.Second}
+	sup := supervisor.New(cfg)
 
-	var result observeResult
+	ctx, cancel := context.WithCancel(rc.ctx)
+	defer cancel()
 
-	for sc := range stateCh {
-		switch sc.To {
-		case supervisor.StateActive:
-		case supervisor.StateQuiescentCandidate:
-			result.dirty = wtIsDirty(rc.wt, ast.info.Path)
-			result.checkpoint = recoverAndRecord(rc.ctx, ast.rt, rc.wt, ast.info.Path,
-				ast.attempt.ID, rc.store, rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, result.dirty)
+	ch := sup.Observe(ctx, ast.rt)
 
-			if rc.cfg.Validator != "" && result.dirty {
-				result.validatorPassed = runValidator(rc.cfg.Validator, ast.info.Path)
-				if result.validatorPassed {
-					rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusCompleted)
-					rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusCompleted)
-					rc.store.EmitEvent(rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, "validated", nil)
-					rc.wt.Remove(ast.info.Path)
-					rc.emitWake("validator_accepted", sc.To, "Validator ACCEPT — task completed")
-					result.exited = true
-					return result
-				}
-				rc.store.EmitEvent(rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, "validation_rejected", nil)
-				rc.emitWake("validator_rejected", sc.To, "Validator REJECT")
-				result.decision = DecisionRetryClean
-				return result
-			}
+	var finalState supervisor.State
+	var exited bool
+	var exitCode int
 
-			rc.emitWake("quiescent", sc.To, "Worker quiescent — awaiting coordinator")
-			decision := rc.awaitDecision()
-			rc.decisions = append(rc.decisions, decision)
-
-			// B2: validate decision against state.
-			if err := rc.gateway.Validate(sc.To, decision, rc.cfg.Validator != "", result.validatorPassed); err != nil {
-				log.Printf("B2: decision rejected: %v (falling back to FAIL)", err)
-				decision = DecisionFail
-			}
-
-			if decision == DecisionValidate && rc.cfg.Validator != "" && result.dirty {
-				result.validatorPassed = runValidator(rc.cfg.Validator, ast.info.Path)
-				if result.validatorPassed {
-					rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusCompleted)
-					rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusCompleted)
-					rc.store.EmitEvent(rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, "validated", nil)
-					rc.wt.Remove(ast.info.Path)
-					rc.emitWake("validator_accepted", sc.To, "Validator ACCEPT — task completed")
-					result.exited = true
-					return result
-				}
-				rc.store.EmitEvent(rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, "validation_rejected", nil)
-				rc.emitWake("validator_rejected", sc.To, "Validator REJECT")
-				result.decision = DecisionRetryClean
-				return result
-			}
-
-			// B4: CONTINUE → existing Worker stdin (gen check).
-			if decision == DecisionContinue || decision == DecisionValidate {
-				leaseTimer := time.NewTimer(continueLeaseTimeout)
-				defer leaseTimer.Stop()
-				select {
-				case sc2, ok := <-stateCh:
-					if !ok {
-						result.exited = true
-						return result
-					}
-					if sc2.To == supervisor.StateExited || sc2.To == supervisor.StateCrashed {
-						result.state = sc2.To
-						result.exited = true
-						return result
-					}
-					continue
-				case <-leaseTimer.C:
-					rc.emitWake("lease_expired", sc.To, "CONTINUE lease expired — re-waking coordinator")
-					continue
-				case <-rc.ctx.Done():
-					result.exited = true
-					return result
-				}
-			}
-
-			result.decision = decision
-			return result
-
-		case supervisor.StateExited:
-			result.exited = true
-			result.state = sc.To
-			result.dirty = wtIsDirty(rc.wt, ast.info.Path)
-			result.checkpoint = recoverAndRecord(rc.ctx, ast.rt, rc.wt, ast.info.Path,
-				ast.attempt.ID, rc.store, rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, result.dirty)
-			return result
-
-		case supervisor.StateCrashed:
-			result.state = sc.To
-			result.dirty = wtIsDirty(rc.wt, ast.info.Path)
-			result.checkpoint = recoverAndRecord(rc.ctx, ast.rt, rc.wt, ast.info.Path,
-				ast.attempt.ID, rc.store, rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, result.dirty)
-			rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
-			rc.store.EmitEvent(rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, "worker_crashed", nil)
-			supervisor.CleanupWorktree(rc.ctx, rc.wt, ast.info.Path)
-			rc.emitWake("worker_crashed", sc.To, "Worker crashed")
-			result.decision = rc.awaitDecision()
-			rc.decisions = append(rc.decisions, result.decision)
-			return result
+	for sc := range ch {
+		finalState = sc.To
+		if sc.To == supervisor.StateExited || sc.To == supervisor.StateCrashed {
+			exited = true
+			exitCode = ast.rt.Wait().ExitCode
+			break
 		}
 	}
-	result.exited = true
-	return result
+
+	// Recovery checkpoint.
+	result := supervisor.Recover(ctx, ast.rt, supervisor.RecoveryConfig{
+		WorktreePath: ast.info.Path, AttemptID: fmt.Sprintf("%d", ast.attempt.ID),
+		SecretScanEnabled: true,
+	}, rc.wt)
+	checkpointSHA := result.CommitSHA
+	rc.store.UpdateAttemptCheckpoint(ast.attempt.ID, checkpointSHA)
+
+	// Run validator.
+	validatorPassed := false
+	if rc.cfg.Validator != "" && checkpointSHA != "" {
+		validatorPassed = rc.runValidator(ast.info.Path, rc.cfg.Validator)
+	}
+
+	status := taskstore.StatusCompleted
+	if !validatorPassed || exitCode != 0 {
+		status = taskstore.StatusFailed
+	}
+	rc.store.UpdateAttemptStatus(ast.attempt.ID, status)
+
+	return observeResult{
+		state: finalState, checkpoint: checkpointSHA, exited: exited,
+		exitCode: exitCode, validatorPassed: validatorPassed,
+		decision: rc.deriveDecision(finalState, validatorPassed),
+	}
 }
 
-// finalizeAttempt handles the terminal states and retry logic.
-// B4: each branch has distinct behavior.
-func (rc *runContext) finalizeAttempt(ast *attemptState, result observeResult) bool {
-	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	ast.rt.Close(stopCtx, 1)
-	cancel()
-
-	// B4: FAIL — task failed, preserve all attempts.
-	if result.decision == DecisionFail {
-		rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
-		rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusFailed)
-		rc.store.EmitEvent(rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, "task_failed", nil)
-		rc.emitWake("task_failed", result.state, "Coordinator decided FAIL")
-		return false
-	}
-
-	// B4: RETRY_CLEAN / REPLACE — new attempt from base.
-	if result.decision == DecisionRetryClean || result.decision == DecisionReplace {
-		rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusCancelled)
-		rc.store.EmitEvent(rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, "attempt_retry", nil)
-		rc.wt.Remove(ast.info.Path)
-		return true
-	}
-
-	if result.state == supervisor.StateCrashed {
-		return result.decision != DecisionFail
-	}
-
-	// Exited path.
-	if result.exited && result.state == supervisor.StateExited {
-		if rc.cfg.Validator != "" {
-			result.validatorPassed = runValidator(rc.cfg.Validator, ast.info.Path)
-			if result.validatorPassed {
-				rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusCompleted)
-				rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusCompleted)
-				rc.store.EmitEvent(rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, "validated", nil)
-				rc.emitWake("validator_accepted", result.state, "Validator ACCEPT — task completed")
-			} else {
-				rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
-				rc.store.EmitEvent(rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, "validation_rejected", nil)
-				rc.emitWake("validator_rejected", result.state, "Validator REJECT — retrying")
-				rc.wt.Remove(ast.info.Path)
-				return true
-			}
-		} else {
-			// B4: COMPLETE — task completed (validator ACCEPT needed per B2 rule).
-			rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusCompleted)
-			rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusCompleted)
-			rc.emitWake("task_completed", result.state, "Task completed successfully")
-		}
-		rc.store.EmitEvent(rc.runID, rc.taskID, ast.attempt.ID, ast.worker.ID, "attempt_completed", nil)
-		if result.checkpoint != "" {
-			supervisor.CleanupWorktree(rc.ctx, rc.wt, ast.info.Path)
-		}
-		return false
-	}
-
-	if !result.exited {
-		return result.decision != DecisionFail
-	}
-
-	rc.wt.Remove(ast.info.Path)
-	return false
-}
-
-// B3: emitWake creates an idempotent wake event.
-func (rc *runContext) emitWake(id string, state supervisor.State, reason string) {
-	key := fmt.Sprintf("wake:%d:%s:%d", rc.runID, id, rc.gateway.Generation())
-	if rc.gateway.IsDuplicate(key) {
-		log.Printf("B3: duplicate wake suppressed: %s", key)
-		return
-	}
-	ev := WakeEvent{ID: id, RunID: rc.runID, TaskID: rc.taskID, State: string(state), Reason: reason, Timestamp: time.Now()}
-	rc.events = append(rc.events, ev)
-	log.Printf("WAKE [%s] state=%s reason=%s key=%s", id, state, reason, key)
-}
-
-// recoverAndRecord uses supervisor.Recover() with secret scan.
-func recoverAndRecord(ctx context.Context, rt *runtime.Runtime, wt *worktree.Manager,
-	worktreePath string, attemptIDVal int64, store *taskstore.Store,
-	runID, taskID, attemptID, workerID int64, dirty bool) string {
-
-	if !dirty {
-		return ""
-	}
-	result := supervisor.Recover(ctx, rt, supervisor.RecoveryConfig{
-		WorktreePath: worktreePath, AttemptID: fmt.Sprintf("%d", attemptIDVal), SecretScanEnabled: true,
-	}, wt)
-	if result.BlockedSecret {
-		log.Printf("SECRET BLOCKED for attempt %d", attemptIDVal)
-		return ""
-	}
-	if result.CommitSHA != "" {
-		store.UpdateAttemptCheckpoint(attemptID, result.CommitSHA)
-		log.Printf("RECOVERED: attempt %d checkpoint %s", attemptIDVal, result.CommitSHA)
-	}
-	return result.CommitSHA
-}
-
-func runValidator(command, cwd string) bool {
-	if command == "" {
-		return true
-	}
-	cmd := exec.Command("sh", "-c", command)
-	if cwd != "" {
-		cmd.Dir = cwd
-	}
+func (rc *runContext) runValidator(worktreePath, validatorCmd string) bool {
+	cmd := exec.Command("bash", "-c", validatorCmd)
+	cmd.Dir = worktreePath
 	out, err := cmd.CombinedOutput()
+	result := strings.TrimSpace(string(out))
 	if err != nil {
-		log.Printf("VALIDATOR FAIL: %v\n%s", err, out)
+		log.Printf("VALIDATOR FAIL: %v — %s", err, result)
 		return false
 	}
-	log.Printf("VALIDATOR PASS: %s", strings.TrimSpace(string(out)))
+	log.Printf("VALIDATOR PASS: %s", result)
 	return true
 }
 
-func wtIsDirty(wt *worktree.Manager, path string) bool {
-	if path == "" {
-		return false
-	}
-	if _, err := os.Stat(path); os.IsNotExist(err) {
-		return false
-	}
-	return !wt.Status(path).Clean
-}
-
-// isInteractive returns true if stdin is a terminal.
-func isInteractive() bool {
-	fi, _ := os.Stdin.Stat()
-	return fi != nil && (fi.Mode()&os.ModeCharDevice) != 0
-}
-
-func (rc *runContext) awaitDecision() Decision {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		select {
-		case <-rc.ctx.Done():
-			return DecisionFail
-		default:
-		}
-		type result struct {
-			line string
-			err  error
-		}
-		ch := make(chan result, 1)
-		go func() { line, err := reader.ReadString('\n'); ch <- result{line, err} }()
-		select {
-		case r := <-ch:
-			if r.err == io.EOF {
-				return DecisionContinue // non-interactive
-			}
-			if r.err != nil {
-				continue
-			}
-			d := Decision(strings.TrimSpace(r.line))
-			// B2: validate against known decisions.
-			switch d {
-			case DecisionStart, DecisionValidate, DecisionComplete, DecisionContinue, DecisionRetryClean, DecisionReplace, DecisionFail:
-				return d
-			default:
-				fmt.Fprintf(os.Stderr, "Unknown: %q\n", d)
-			}
-		case <-time.After(5 * time.Second):
-			return DecisionContinue
-		case <-rc.ctx.Done():
-			return DecisionFail
-		}
+func (rc *runContext) deriveDecision(state supervisor.State, validatorPassed bool) Decision {
+	switch {
+	case state == supervisor.StateExited && validatorPassed:
+		return DecisionComplete
+	case state == supervisor.StateExited || state == supervisor.StateCrashed:
+		return DecisionRetryClean
+	default:
+		return DecisionContinue
 	}
 }
 
+func (rc *runContext) validatorResult(result observeResult) string {
+	if result.validatorPassed {
+		return "PASS"
+	}
+	return "FAIL"
+}
+
+func (rc *runContext) allowedDecisions(result observeResult) []string {
+	switch {
+	case result.validatorPassed:
+		return []string{"COMPLETE", "RETRY_CLEAN", "FAIL"}
+	case result.exited:
+		return []string{"RETRY_CLEAN", "REPLACE", "FAIL"}
+	default:
+		return []string{"CONTINUE", "RETRY_CLEAN", "FAIL"}
+	}
+}
+
+// runValidatorBinary executes an external validator command.
+func runValidatorBinary(worktreePath, validatorCmd string) (bool, string) {
+	cmd := exec.Command("bash", "-c", validatorCmd)
+	cmd.Dir = worktreePath
+	out, err := cmd.CombinedOutput()
+	result := strings.TrimSpace(string(out))
+	if err != nil {
+		return false, result
+	}
+	return true, result
+}
+
+// recoverAndRecord runs recovery and records the checkpoint SHA.
+func recoverAndRecord(ctx context.Context, rt *runtime.Runtime, wt *worktree.Manager,
+	worktreePath string, attemptID int64, store *taskstore.Store, runID, taskID, workerID int64) {
+	result := supervisor.Recover(ctx, rt, supervisor.RecoveryConfig{
+		WorktreePath: worktreePath, AttemptID: fmt.Sprintf("%d", attemptID),
+		SecretScanEnabled: true,
+	}, wt)
+	if result.Checkpointed {
+		store.UpdateAttemptCheckpoint(attemptID, result.CommitSHA)
+		store.EmitEvent(runID, taskID, attemptID, workerID, "checkpoint", nil)
+	}
+}
+
+// OpenStore creates a file-backed task store.
 func OpenStore(path string) (*taskstore.Store, error) {
-	if path == "" {
-		return taskstore.NewInMemory()
-	}
-	dir := filepath.Dir(path)
-	if dir != "." {
-		os.MkdirAll(dir, 0755)
-	}
 	return taskstore.New(path)
 }
+
+// Ensure fmt is used.
+var _ = fmt.Sprintf

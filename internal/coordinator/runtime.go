@@ -176,6 +176,8 @@ func buildInstruction(result Result) string {
 		return "Run the validator against the current checkpoint."
 	case DecisionContinue:
 		return "Continue executing. No changes needed."
+	case DecisionComplete:
+		return "Task completed successfully. Stop the run."
 	case DecisionRetryClean:
 		return "Discard current work. Start a fresh attempt with the same task."
 	case DecisionReplace:
