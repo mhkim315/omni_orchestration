@@ -163,6 +163,21 @@ func (s *Store) migrate() error {
 		payload TEXT NOT NULL DEFAULT '{}',
 		created_at TEXT NOT NULL DEFAULT (datetime('now'))
 	);
+	CREATE TABLE IF NOT EXISTS run_records (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		run_id INTEGER NOT NULL REFERENCES runs(id),
+		provider TEXT NOT NULL DEFAULT '',
+		model TEXT NOT NULL DEFAULT '',
+		role TEXT NOT NULL DEFAULT '',
+		task_category TEXT NOT NULL DEFAULT '',
+		repo TEXT NOT NULL DEFAULT '',
+		attempt_count INTEGER NOT NULL DEFAULT 0,
+		validator_reject_count INTEGER NOT NULL DEFAULT 0,
+		replacement_count INTEGER NOT NULL DEFAULT 0,
+		duration_ms INTEGER NOT NULL DEFAULT 0,
+		final_adopted_attempt INTEGER NOT NULL DEFAULT 0,
+		created_at TEXT NOT NULL DEFAULT (datetime('now'))
+	);
 	CREATE TABLE IF NOT EXISTS event_acks (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		event_id INTEGER NOT NULL UNIQUE REFERENCES events(id),
@@ -367,4 +382,156 @@ func scanEvents(rows *sql.Rows) ([]*Event, error) {
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// ── Performance Data Collection (D) ──
+
+// RunRecord captures the outcome of one orchestrator run for provider stats.
+type RunRecord struct {
+	ID                   int64  `json:"id"`
+	RunID                int64  `json:"run_id"`
+	Provider             string `json:"provider"`
+	Model                string `json:"model"`
+	Role                 string `json:"role"`
+	TaskCategory         string `json:"task_category"`
+	Repo                 string `json:"repo"`
+	AttemptCount         int    `json:"attempt_count"`
+	ValidatorRejectCount int    `json:"validator_reject_count"`
+	ReplacementCount     int    `json:"replacement_count"`
+	DurationMs           int64  `json:"duration_ms"`
+	FinalAdoptedAttempt  int    `json:"final_adopted_attempt"`
+	CreatedAt            string `json:"created_at"`
+}
+
+// ProviderStats summarizes performance for one provider+category.
+type ProviderStats struct {
+	Provider      string
+	TaskCategory  string
+	TotalRuns     int
+	SuccessRate   float64 // 0.0 - 1.0
+	AvgAttempts   float64
+	AvgDurationMs int64
+	Confidence    string // "high", "low", "insufficient"
+}
+
+// RecordRun inserts a run record. Called once per orchestrator run.
+func (s *Store) RecordRun(runID int64, provider, model, role, taskCategory, repo string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`INSERT INTO run_records (run_id, provider, model, role, task_category, repo)
+		 VALUES (?,?,?,?,?,?)`,
+		runID, provider, model, role, taskCategory, repo,
+	)
+	return err
+}
+
+// RecordAttemptOutcome updates the run record with attempt-level stats.
+func (s *Store) RecordAttemptOutcome(runID int64, attemptNum int, validatorPassed bool, durationMs int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if validatorPassed {
+		_, err := s.db.Exec(
+			`UPDATE run_records SET attempt_count=MAX(attempt_count,?),
+			 validator_reject_count=validator_reject_count,
+			 duration_ms=duration_ms+? WHERE run_id=?`,
+			attemptNum, durationMs, runID,
+		)
+		return err
+	}
+	_, err := s.db.Exec(
+		`UPDATE run_records SET attempt_count=MAX(attempt_count,?),
+		 validator_reject_count=validator_reject_count+1,
+		 duration_ms=duration_ms+? WHERE run_id=?`,
+		attemptNum, durationMs, runID,
+	)
+	return err
+}
+
+// RecordAdoption marks the final adopted attempt for a run.
+func (s *Store) RecordAdoption(runID int64, attemptNum int, adopted bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if adopted {
+		_, err := s.db.Exec(
+			`UPDATE run_records SET final_adopted_attempt=? WHERE run_id=?`,
+			attemptNum, runID,
+		)
+		return err
+	}
+	return nil
+}
+
+// GetProviderStats returns aggregated stats for a provider + task category.
+// Confidence: "high" (≥10 runs), "low" (3-9 runs), "insufficient" (<3 runs).
+func (s *Store) GetProviderStats(provider, taskCategory string) (*ProviderStats, error) {
+	st := &ProviderStats{Provider: provider, TaskCategory: taskCategory}
+
+	rows, err := s.db.Query(
+		`SELECT COUNT(*), AVG(CAST(validator_reject_count=0 AND final_adopted_attempt>0 AS FLOAT)),
+		 AVG(CAST(attempt_count AS FLOAT)), AVG(CAST(duration_ms AS FLOAT))
+		 FROM run_records
+		 WHERE provider=? AND task_category=? AND final_adopted_attempt>0`,
+		provider, taskCategory,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		st.Confidence = "insufficient"
+		return st, nil
+	}
+
+	var count int
+	var successRate, avgAttempts, avgDuration sql.NullFloat64
+	rows.Scan(&count, &successRate, &avgAttempts, &avgDuration)
+	st.TotalRuns = count
+	if count > 0 {
+		st.SuccessRate = successRate.Float64
+		st.AvgAttempts = avgAttempts.Float64
+		st.AvgDurationMs = int64(avgDuration.Float64)
+	}
+
+	switch {
+	case count >= 10:
+		st.Confidence = "high"
+	case count >= 3:
+		st.Confidence = "low"
+	default:
+		st.Confidence = "insufficient"
+	}
+	return st, nil
+}
+
+// GetBestProvider returns the provider with the highest recent success rate
+// for a given task category + repo. Returns empty result if insufficient data.
+func (s *Store) GetBestProvider(taskCategory, repo string) (string, *ProviderStats, error) {
+
+	rows, err := s.db.Query(
+		`SELECT provider, COUNT(*) as cnt,
+		 AVG(CAST(validator_reject_count=0 AND final_adopted_attempt>0 AS FLOAT)) as rate
+		 FROM run_records
+		 WHERE task_category=? AND repo=? AND final_adopted_attempt>0
+		 GROUP BY provider HAVING cnt >= 3
+		 ORDER BY rate DESC, cnt DESC LIMIT 1`,
+		taskCategory, repo,
+	)
+	if err != nil {
+		return "", nil, err
+	}
+	defer rows.Close()
+
+	if !rows.Next() {
+		return "", &ProviderStats{Confidence: "insufficient"}, nil
+	}
+
+	var provider string
+	var cnt int
+	var rate float64
+	rows.Scan(&provider, &cnt, &rate)
+
+	stats, _ := s.GetProviderStats(provider, taskCategory)
+	return provider, stats, nil
 }

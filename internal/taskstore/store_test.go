@@ -283,3 +283,115 @@ func TestStore_AttemptCheckpoint(t *testing.T) {
 		t.Errorf("checkpoint_commit = %s", ckpt)
 	}
 }
+
+// ── D: Performance Data Collection Tests ──
+
+func TestD_RecordAndQueryRun(t *testing.T) {
+	s, _ := NewInMemory()
+	defer s.Close()
+
+	s.CreateRun() // run_id=1
+	s.RecordRun(1, "claude", "claude-5", "primary", "bug_fix", "test-repo")
+	s.RecordAttemptOutcome(1, 1, true, 5000)
+	s.RecordAdoption(1, 1, true)
+
+	stats, err := s.GetProviderStats("claude", "bug_fix")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalRuns != 1 {
+		t.Errorf("total = %d, want 1", stats.TotalRuns)
+	}
+	if stats.Confidence != "insufficient" {
+		t.Errorf("confidence = %s, want insufficient", stats.Confidence)
+	}
+}
+
+func TestD_MultipleProviders(t *testing.T) {
+	s, _ := NewInMemory(); defer s.Close()
+
+	// 2 runs for claude, 2 for codex.
+	s.CreateRun(); s.RecordRun(1, "claude", "claude-5", "primary", "bug_fix", "repo")
+	s.RecordAttemptOutcome(1, 1, true, 3000); s.RecordAdoption(1, 1, true)
+	s.CreateRun(); s.RecordRun(2, "claude", "claude-5", "primary", "bug_fix", "repo")
+	s.RecordAttemptOutcome(2, 1, true, 3000); s.RecordAdoption(2, 1, true)
+
+	s.CreateRun(); s.RecordRun(3, "codex", "gpt-5", "primary", "bug_fix", "repo")
+	s.RecordAttemptOutcome(3, 1, true, 4000); s.RecordAdoption(3, 1, true)
+	s.CreateRun(); s.RecordRun(4, "codex", "gpt-5", "primary", "bug_fix", "repo")
+	s.RecordAttemptOutcome(4, 1, true, 5000); s.RecordAdoption(4, 1, true)
+
+	claude, _ := s.GetProviderStats("claude", "bug_fix")
+	if claude.TotalRuns != 2 { t.Errorf("claude total = %d", claude.TotalRuns) }
+
+	codex, _ := s.GetProviderStats("codex", "bug_fix")
+	if codex.TotalRuns != 2 { t.Errorf("codex total = %d", codex.TotalRuns) }
+
+	best, bestStats, _ := s.GetBestProvider("bug_fix", "repo")
+	t.Logf("Best: %s conf=%s rate=%f", best, bestStats.Confidence, bestStats.SuccessRate)
+}
+
+func TestD_EmptyStats(t *testing.T) {
+	s, _ := NewInMemory()
+	defer s.Close()
+
+	stats, err := s.GetProviderStats("nonexistent", "category")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalRuns != 0 {
+		t.Errorf("total = %d, want 0", stats.TotalRuns)
+	}
+	if stats.Confidence != "insufficient" {
+		t.Errorf("confidence = %s, want insufficient", stats.Confidence)
+	}
+
+	best, _, _ := s.GetBestProvider("nonexistent", "repo")
+	if best != "" {
+		t.Errorf("best = %s, want empty", best)
+	}
+}
+
+func TestD_AdoptedVsNonAdopted(t *testing.T) {
+	s, _ := NewInMemory()
+	defer s.Close()
+
+	// Adopted run.
+	s.CreateRun()
+	s.RecordRun(1, "claude", "m1", "primary", "task", "repo")
+	s.RecordAttemptOutcome(1, 1, true, 1000)
+	s.RecordAdoption(1, 1, true)
+
+	// Non-adopted run (same provider, but final_adopted_attempt=0).
+	s.CreateRun()
+	s.RecordRun(2, "claude", "m1", "primary", "task", "repo")
+	s.RecordAttemptOutcome(2, 1, true, 1000)
+	// Not adopted.
+
+	stats, _ := s.GetProviderStats("claude", "task")
+	t.Logf("Stats: total=%d success=%f confidence=%s", stats.TotalRuns, stats.SuccessRate, stats.Confidence)
+	// Only adopted runs count in stats.
+	if stats.TotalRuns != 1 {
+		t.Errorf("adopted-only count = %d, want 1", stats.TotalRuns)
+	}
+}
+
+func TestD_ValidatorRejectCount(t *testing.T) {
+	s, _ := NewInMemory()
+	defer s.Close()
+
+	s.CreateRun()
+	s.RecordRun(1, "claude", "m1", "primary", "task", "repo")
+	s.RecordAttemptOutcome(1, 1, false, 1000) // attempt 1 rejected
+	s.RecordAttemptOutcome(1, 2, false, 2000) // attempt 2 rejected
+	s.RecordAttemptOutcome(1, 3, true, 1500)  // attempt 3 accepted
+	s.RecordAdoption(1, 3, true)
+
+	stats, _ := s.GetProviderStats("claude", "task")
+	if stats.TotalRuns != 1 {
+		t.Errorf("total = %d", stats.TotalRuns)
+	}
+	if stats.AvgAttempts < 2.5 {
+		t.Errorf("avg attempts = %f, want >= 2.5", stats.AvgAttempts)
+	}
+}
