@@ -1,11 +1,11 @@
-// Orchestrator CLI — integrates worktree, runtime, supervisor, and taskstore
-// into a coordinated task-execution loop with validator and recovery.
+// Orchestrator CLI — integrates worktree, runtime, supervisor, taskstore
+// and coordinator into a coordinated task-execution loop.
 //
 // Usage:
 //
 //	orchestrator run --task "bug fix" --command claude --repo /path/to/repo
+//	orchestrator run --task "..." --command claude --repo . --coordinator codex
 //	orchestrator run --task "..." --command claude --repo . --validator "test -f output.txt"
-//	orchestrator run --task "..." --command claude --repo . --store /tmp/orch.db
 package main
 
 import (
@@ -14,11 +14,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"syscall"
 
+	"github.com/miinanii/omni_orchestration/internal/coordinator"
 	"github.com/miinanii/omni_orchestration/internal/orchestrator"
+	"github.com/miinanii/omni_orchestration/internal/runtime"
 	"github.com/miinanii/omni_orchestration/internal/worktree"
 )
 
@@ -37,9 +40,10 @@ func run() error {
 	cwd := runCmd.String("cwd", "", "Working directory (defaults to worktree path)")
 	validator := runCmd.String("validator", "", "External shell validation command (empty=skip)")
 	storePath := runCmd.String("store", "", "SQLite file path (empty=in-memory)")
+	coordFlag := runCmd.String("coordinator", "", "Coordinator mode: codex (default: auto-VALIDATE)")
 
 	if len(os.Args) < 2 || os.Args[1] != "run" {
-		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--validator <cmd>] [--store <path>]\n")
+		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--coordinator codex] [--validator <cmd>] [--store <path>]\n")
 		os.Exit(2)
 	}
 	runCmd.Parse(os.Args[2:])
@@ -49,7 +53,7 @@ func run() error {
 		os.Exit(2)
 	}
 
-	// Gate 2: file-backed store default (in temp dir if not specified).
+	// Store.
 	path := *storePath
 	if path == "" {
 		path = filepath.Join(os.TempDir(), "omni-orchestrator.db")
@@ -70,6 +74,22 @@ func run() error {
 		CWD:       *cwd,
 		Validator: *validator,
 		StorePath: path,
+	}
+
+	// Fix 1: Codex coordinator wiring.
+	if *coordFlag == "codex" {
+		if _, err := exec.LookPath("codex"); err != nil {
+			log.Printf("codex not found on PATH — falling back to auto-VALIDATE mode")
+		} else {
+			codexCoord := coordinator.NewCodexCoordinator()
+			rt := runtime.NewWithID("coordinator-codex", 1)
+			cfg.Coordinator = coordinator.NewCoordinatorRuntime(rt, codexCoord)
+			log.Printf("Coordinator: codex (auto-VALIDATE if codex unavailable)")
+		}
+	} else if *coordFlag != "" {
+		return fmt.Errorf("unknown coordinator mode: %q (supported: codex)", *coordFlag)
+	} else {
+		log.Printf("Coordinator: auto-VALIDATE (no --coordinator flag)")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -61,11 +61,13 @@ Validator output: %s
 Diff summary: %s
 
 Return EXACTLY one decision as JSON with no other text:
-{"decision": "<DECISION>", "reason": "<one-line explanation>"}
+{"decision": "<DECISION>", "reason": "<one-line explanation>", "next_instruction": "<instruction for worker>"}
 
+The next_instruction field is REQUIRED — it will be delivered to the worker process stdin.
 Valid decisions:
 - VALIDATE: run the validator against the current checkpoint
 - CONTINUE: keep the worker running, no action needed
+- COMPLETE: validator passed, task is done
 - RETRY_CLEAN: discard current work, start a fresh attempt with same task
 - REPLACE: task specification is wrong, needs human intervention
 - FAIL: unrecoverable error, stop the run
@@ -89,15 +91,16 @@ func parseCodexDecision(output string) (Result, error) {
 	}
 
 	var parsed struct {
-		Decision string `json:"decision"`
-		Reason   string `json:"reason"`
+		Decision        string `json:"decision"`
+		Reason          string `json:"reason"`
+		NextInstruction string `json:"next_instruction"`
 	}
 	if err := json.Unmarshal(decoded, &parsed); err != nil {
 		return Result{Decision: DecisionFail, Reason: fmt.Sprintf("parse decision: %v", err)}, nil
 	}
 
 	decision := normalizeDecision(parsed.Decision)
-	return Result{Decision: decision, Reason: parsed.Reason}, nil
+	return Result{Decision: decision, Reason: parsed.Reason, NextInstruction: parsed.NextInstruction}, nil
 }
 
 // extractJSON finds the last complete JSON object in a string.

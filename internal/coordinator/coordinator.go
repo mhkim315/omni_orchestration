@@ -30,10 +30,12 @@ const (
 	DecisionFail       Decision = "FAIL"
 )
 
-// Result is a coordinator decision with a machine-readable reason.
+// Result is a coordinator decision with a machine-readable reason
+// and an optional next instruction for the worker.
 type Result struct {
-	Decision Decision `json:"decision"`
-	Reason   string   `json:"reason"`
+	Decision        Decision `json:"decision"`
+	Reason          string   `json:"reason"`
+	NextInstruction string   `json:"next_instruction,omitempty"`
 }
 
 // RunState is a read-only snapshot of the current run for the coordinator.
@@ -74,5 +76,5 @@ func (m *MockCoordinator) Decide(ctx context.Context, state RunState) (Result, e
 	}
 	d := m.Decisions[m.pos]
 	m.pos++
-	return Result{Decision: d, Reason: fmt.Sprintf("mock decision #%d: %s", m.pos, d)}, nil
+	return Result{Decision: d, Reason: fmt.Sprintf("mock decision #%d: %s", m.pos, d), NextInstruction: fmt.Sprintf("Execute: %s", d)}, nil
 }

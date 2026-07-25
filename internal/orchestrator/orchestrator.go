@@ -180,7 +180,9 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 
 	attemptNum := 1
 	baseCommit := "HEAD"
-	nextInstruction := startResp.NextInstruction
+	// Fix 3: first attempt always receives cfg.Task as the instruction.
+	// Subsequent retries receive coordinator next_instruction + cfg.Task.
+	nextInstruction := cfg.Task
 
 	for {
 		select {
@@ -228,7 +230,11 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 
 		// RETRY_CLEAN or REPLACE → new attempt.
 		attemptNum++
+		// Fix 3: retry receives coordinator instruction + original task.
 		nextInstruction = resp.NextInstruction
+		if nextInstruction == "" || !strings.Contains(nextInstruction, cfg.Task) {
+			nextInstruction = cfg.Task + "\n" + nextInstruction
+		}
 		if resp.Decision == DecisionReplace {
 			baseCommit = ast.info.Branch
 		} else {
@@ -311,6 +317,30 @@ func (rc *runContext) observeAndWait(ast *attemptState) observeResult {
 			exited = true
 			exitCode = ast.rt.Wait().ExitCode
 			break
+		}
+		// Fix 4: QUIESCENT_CANDIDATE → wake coordinator for CONTINUE/other.
+		if sc.To == supervisor.StateQuiescentCandidate {
+			coordGen := rc.coordinatorGeneration()
+			resp, err := rc.wakeCoordinator(coordGen, coordinator.WakePacket{
+				RunID: rc.runID, TaskID: rc.taskID, TaskTitle: rc.cfg.Task,
+				AttemptNumber: 1, AttemptStatus: "running",
+				WorkerState: string(supervisor.StateQuiescentCandidate), ExitCode: 0,
+				AllowedDecisions: []string{"CONTINUE", "RETRY_CLEAN", "FAIL"},
+			})
+			if err == nil && resp.Decision == coordinator.DecisionContinue {
+				// Re-arm supervisor via continue-lease loop.
+				select {
+				case <-time.After(30 * time.Second):
+				case <-ctx.Done():
+				}
+				continue
+			}
+			if err == nil && resp.Decision == coordinator.DecisionRetryClean {
+				ast.rt.Close(ctx, ast.rt.Generation())
+				exitCode = ast.rt.Wait().ExitCode
+				exited = true
+				break
+			}
 		}
 	}
 

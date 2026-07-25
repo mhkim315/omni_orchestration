@@ -130,10 +130,14 @@ func (c *CoordinatorRuntime) Wake(ctx context.Context, generation int64, pkt Wak
 		}
 	}
 
+	instruction := result.NextInstruction
+	if instruction == "" {
+		instruction = buildInstruction(result)
+	}
 	return WakeResponse{
 		Decision:        result.Decision,
 		Reason:          result.Reason,
-		NextInstruction: buildInstruction(result),
+		NextInstruction: instruction,
 	}, nil
 }
 
