@@ -22,6 +22,7 @@ import (
 type Decision string
 
 const (
+	DecisionStart      Decision = "START"
 	DecisionValidate   Decision = "VALIDATE"
 	DecisionContinue   Decision = "CONTINUE"
 	DecisionComplete   Decision = "COMPLETE"

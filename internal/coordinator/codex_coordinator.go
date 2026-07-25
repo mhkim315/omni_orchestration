@@ -122,6 +122,8 @@ func extractJSON(s string) []byte {
 
 func normalizeDecision(s string) Decision {
 	switch strings.ToUpper(strings.TrimSpace(s)) {
+	case "START":
+		return DecisionStart
 	case "VALIDATE":
 		return DecisionValidate
 	case "CONTINUE":

@@ -28,7 +28,7 @@ type WakePacket = coordinator.WakePacket
 type WakeResponse = coordinator.WakeResponse
 
 const (
-	DecisionStart      = coordinator.DecisionValidate // initial → START is VALIDATE
+	DecisionStart      = coordinator.DecisionStart
 	DecisionValidate   = coordinator.DecisionValidate
 	DecisionComplete   = coordinator.DecisionComplete
 	DecisionContinue   = coordinator.DecisionContinue

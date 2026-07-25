@@ -112,6 +112,8 @@ func parseReasonixResponse(out []byte) (Result, error) {
 // parseDecision maps a raw string to a Decision value (case-insensitive).
 func parseDecision(raw string) Decision {
 	switch strings.ToUpper(strings.TrimSpace(raw)) {
+	case "START":
+		return DecisionStart
 	case "VALIDATE":
 		return DecisionValidate
 	case "CONTINUE":
