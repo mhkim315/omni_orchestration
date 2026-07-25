@@ -4,9 +4,11 @@
 //
 // Contracts:
 //   - Every Runtime instance owns one generation (monotonic, immutable after Start).
-//   - Stale writers are rejected: Write/Interrupt/Stop after Close returns ErrRuntimeClosed.
+//   - Stale writers are rejected: Write/Interrupt/Close after Close returns ErrRuntimeClosed.
 //   - ExitEvent is stored once and readable by any number of Wait callers.
 //   - All exported methods are safe for concurrent use.
+//   - Generation 0 is internal-only (New, Stop compat). Callers use the generation
+//     returned by Start or assigned via NewWithID.
 package runtime
 
 import (
@@ -66,17 +68,28 @@ type Runtime struct {
 	cancel context.CancelFunc
 }
 
-// New creates an unstarted Runtime.
+// New creates an unstarted Runtime with generation 0.
+// generation 0 is reserved — it bypasses generation checks only in the
+// Start method (which assigns gen=1) and Stop alias (which delegates to
+// Close with gen=0 for backward compat).
 func New() *Runtime {
 	return &Runtime{
 		done: make(chan struct{}),
 	}
 }
 
-// NewWithID creates an unstarted Runtime with a caller-assigned identity.
-func NewWithID(id string) *Runtime {
-	r := New()
-	r.id = id
+// NewWithID creates an unstarted Runtime with a caller-assigned identity
+// and a pre-assigned generation (must be > 0). All subsequent operations
+// must present this generation.
+func NewWithID(id string, generation int64) *Runtime {
+	if generation < 1 {
+		generation = 1
+	}
+	r := &Runtime{
+		done: make(chan struct{}),
+		id:   id,
+		gen:  generation,
+	}
 	return r
 }
 
@@ -89,6 +102,7 @@ func (r *Runtime) ID() string {
 
 // Start spawns the command in a PTY. The working directory may be empty
 // (defaults to "/"). Returns an error if already started.
+// Start assigns generation 1 if the runtime was created with New() (gen==0).
 func (r *Runtime) Start(command string, cwd string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -111,7 +125,12 @@ func (r *Runtime) Start(command string, cwd string) error {
 	}
 
 	r.ctx, r.cancel = context.WithCancel(context.Background())
-	r.gen++
+
+	// Assign generation on first Start. NewWithID pre-assigns; New
+	// starts at 1.
+	if r.gen == 0 {
+		r.gen = 1
+	}
 
 	cmd := exec.Command("bash", "-c", command)
 	cmd.Dir = cwd
@@ -137,6 +156,7 @@ func (r *Runtime) Start(command string, cwd string) error {
 			r.cancel()
 			return fmt.Errorf("runtime: pty start: %w", err)
 		}
+		// R1-A Fix 1: keep cmd2 as the owned process, not the failed cmd.
 		r.cmd = cmd2
 		r.ptmx = ptmx
 	} else {
@@ -144,8 +164,6 @@ func (r *Runtime) Start(command string, cwd string) error {
 		r.ptmx = ptmx
 	}
 
-	r.cmd = cmd
-	r.ptmx = ptmx
 	r.started = true
 
 	// Start the output reader goroutine.
@@ -163,6 +181,7 @@ func (r *Runtime) Start(command string, cwd string) error {
 
 // Write sends data to the PTY. The generation must match the current runtime.
 // Returns ErrRuntimeClosed if stopped, ErrStaleGeneration if generation mismatches.
+// generation must be > 0 (no zero bypass).
 func (r *Runtime) Write(generation int64, input []byte) (int, error) {
 	r.mu.Lock()
 	if !r.started {
@@ -173,7 +192,7 @@ func (r *Runtime) Write(generation int64, input []byte) (int, error) {
 		r.mu.Unlock()
 		return 0, ErrRuntimeClosed
 	}
-	if generation != 0 && generation != r.gen {
+	if generation != r.gen {
 		r.mu.Unlock()
 		return 0, ErrStaleGeneration
 	}
@@ -200,7 +219,7 @@ func (r *Runtime) Observe() <-chan string {
 }
 
 // Interrupt sends SIGINT to the child process group.
-// The generation must match the current runtime.
+// The generation must match the current runtime (must be > 0).
 func (r *Runtime) Interrupt(generation int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -208,7 +227,7 @@ func (r *Runtime) Interrupt(generation int64) error {
 	if !r.started || r.cmd == nil || r.cmd.Process == nil {
 		return ErrRuntimeClosed
 	}
-	if generation != 0 && generation != r.gen {
+	if generation != r.gen {
 		return ErrStaleGeneration
 	}
 	if r.closed {
@@ -220,14 +239,14 @@ func (r *Runtime) Interrupt(generation int64) error {
 // Close terminates the child process and waits for it to exit.
 // It sends SIGTERM, waits up to graceful seconds, then SIGKILL.
 // Close is idempotent — repeated calls are safe.
-// The generation must match the current runtime.
+// generation must match (no zero bypass except via Stop alias).
 func (r *Runtime) Close(ctx context.Context, generation int64) error {
 	r.mu.Lock()
 	if !r.started {
 		r.mu.Unlock()
-		return nil // idempotent
+		return nil // idempotent (never started)
 	}
-	if generation != 0 && generation != r.gen {
+	if generation != r.gen {
 		r.mu.Unlock()
 		return ErrStaleGeneration
 	}
@@ -254,6 +273,13 @@ func (r *Runtime) Close(ctx context.Context, generation int64) error {
 
 	if cmd == nil || cmd.Process == nil {
 		return nil
+	}
+
+	// If already exited, don't signal a potentially recycled PID.
+	select {
+	case <-done:
+		return nil
+	default:
 	}
 
 	// Send SIGTERM first.
@@ -284,9 +310,20 @@ func (r *Runtime) Close(ctx context.Context, generation int64) error {
 	}
 }
 
-// Stop is an alias for Close (backward compatibility).
+// Stop is a backward-compatible alias for Close that uses generation 0.
+// generation 0 is only accepted from Stop; direct Close callers must
+// present the correct generation.
 func (r *Runtime) Stop(ctx context.Context) error {
-	return r.Close(ctx, 0)
+	r.mu.Lock()
+	gen := r.gen
+	started := r.started
+	closed := r.closed
+	r.mu.Unlock()
+
+	if !started || closed {
+		return nil
+	}
+	return r.Close(ctx, gen)
 }
 
 // Wait blocks until the child process exits. Returns the stored ExitEvent.
