@@ -16,6 +16,7 @@ import (
 // coordinator wraps every call with a 180s context timeout.
 type ReasonixCoordinator struct {
 	Bin     string // path to reasonix CLI (default: "reasonix")
+	Model   string // model override in provider/model format (optional)
 	Timeout time.Duration
 }
 
@@ -41,7 +42,12 @@ func (c *ReasonixCoordinator) Decide(ctx context.Context, state RunState) (Resul
 	defer cancel()
 
 	prompt := buildReasonixPrompt(state)
-	cmd := exec.CommandContext(ctx, bin, "--max-steps", "0", "--prompt", prompt)
+	args := []string{"--max-steps", "0"}
+	if c.Model != "" {
+		args = append(args, "-model", c.Model)
+	}
+	args = append(args, "--prompt", prompt)
+	cmd := exec.CommandContext(ctx, bin, args...)
 	out, err := cmd.Output()
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {

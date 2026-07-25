@@ -15,8 +15,9 @@ import (
 // The contract is identical to CodexCoordinator — same prompt format,
 // same JSON response schema, same decision vocabulary.
 type ClaudeCoordinator struct {
-	Bin   string // path to claude CLI (default: "claude")
-	Model string // model override (optional)
+	Bin    string // path to claude CLI (default: "claude")
+	Model  string // model override (optional)
+	Effort string // effort level: low|medium|high (optional)
 }
 
 // NewClaudeCoordinator returns a Claude-backed coordinator.
@@ -37,6 +38,9 @@ func (c *ClaudeCoordinator) Decide(ctx context.Context, state RunState) (Result,
 	args := []string{"-p", "--output-format", "json"}
 	if c.Model != "" {
 		args = append(args, "--model", c.Model)
+	}
+	if c.Effort != "" {
+		args = append(args, "--effort", c.Effort)
 	}
 	args = append(args, prompt)
 

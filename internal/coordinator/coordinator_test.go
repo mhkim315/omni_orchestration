@@ -644,6 +644,94 @@ func TestProviderNames_IncludesAGY(t *testing.T) {
 	}
 }
 
+// ── v0.4: AgentProfile + Capabilities tests ──
+
+func TestAgentProfile_Defaults(t *testing.T) {
+	for _, name := range []string{"codex", "claude", "agy", "reasonix"} {
+		p := DefaultProfile(name)
+		if p.Provider != name {
+			t.Errorf("DefaultProfile(%s).Provider = %s", name, p.Provider)
+		}
+		if p.Model == "" {
+			t.Errorf("DefaultProfile(%s).Model is empty", name)
+		}
+		if p.Role != "coordinator" {
+			t.Errorf("DefaultProfile(%s).Role = %s", name, p.Role)
+		}
+	}
+}
+
+func TestAgentProfile_ApplyProfile(t *testing.T) {
+	// Codex: model only.
+	c := NewCodexCoordinator()
+	c.ApplyProfile(AgentProfile{Model: "gpt-5.2"})
+	if c.Model != "gpt-5.2" {
+		t.Errorf("Codex model = %s, want gpt-5.2", c.Model)
+	}
+
+	// Claude: model + effort.
+	cl := NewClaudeCoordinator()
+	cl.ApplyProfile(AgentProfile{Model: "claude-sonnet-5", Mode: "xhigh"})
+	if cl.Model != "claude-sonnet-5" || cl.Effort != "xhigh" {
+		t.Errorf("Claude: model=%s effort=%s", cl.Model, cl.Effort)
+	}
+
+	// AGY: model + effort.
+	a := NewAGYCoordinator()
+	a.ApplyProfile(AgentProfile{Model: "gemini-2.5-pro", Mode: "medium"})
+	if a.Model != "gemini-2.5-pro" || a.Effort != "medium" {
+		t.Errorf("AGY: model=%s effort=%s", a.Model, a.Effort)
+	}
+
+	// Reasonix: model only.
+	r := NewReasonixCoordinator()
+	r.ApplyProfile(AgentProfile{Model: "gpt-5.1"})
+	if r.Model != "gpt-5.1" {
+		t.Errorf("Reasonix model = %s, want gpt-5.1", r.Model)
+	}
+}
+
+func TestCapabilities(t *testing.T) {
+	tests := []struct {
+		provider  string
+		model     bool
+		effort    bool
+		discovery bool
+	}{
+		{"codex", true, false, false},
+		{"claude", true, true, false},
+		{"agy", true, true, true},
+		{"reasonix", true, false, false},
+		{"unknown", false, false, false},
+	}
+	for _, tt := range tests {
+		c := ProviderCapabilities(tt.provider)
+		if c.ModelSelection != tt.model || c.EffortSelection != tt.effort || c.ModelDiscovery != tt.discovery {
+			t.Errorf("ProviderCapabilities(%s) = %+v, want model=%v effort=%v discovery=%v",
+				tt.provider, c, tt.model, tt.effort, tt.discovery)
+		}
+	}
+}
+
+func TestAgentProfile_ProfileMethods(t *testing.T) {
+	// Each coordinator's Profile() returns correct provider.
+	tests := []struct {
+		coord    interface{ Profile() AgentProfile }
+		provider string
+	}{
+		{NewCodexCoordinator(), "codex"},
+		{NewClaudeCoordinator(), "claude"},
+		{NewAGYCoordinator(), "agy"},
+		{NewReasonixCoordinator(), "reasonix"},
+	}
+	for _, tt := range tests {
+		p := tt.coord.Profile()
+		if p.Provider != tt.provider {
+			t.Errorf("%s Profile().Provider = %s", tt.provider, p.Provider)
+		}
+	}
+}
+
 // ── Helpers ──
 
 func runGit(t *testing.T, dir string, args ...string) {

@@ -4,7 +4,8 @@
 // Usage:
 //
 //	orchestrator run --task "bug fix" --command claude --repo /path/to/repo
-//	orchestrator run --task "..." --command claude --repo . --coordinator codex
+//	orchestrator run --task "..." --command claude --repo . --coordinator codex --model gpt-5.2
+//	orchestrator run --task "..." --command claude --repo . --coordinator claude --effort high
 //	orchestrator run --task "..." --command claude --repo . --validator "test -f output.txt"
 package main
 
@@ -40,10 +41,12 @@ func run() error {
 	cwd := runCmd.String("cwd", "", "Working directory (defaults to worktree path)")
 	validator := runCmd.String("validator", "", "External shell validation command (empty=skip)")
 	storePath := runCmd.String("store", "", "SQLite file path (empty=in-memory)")
-	coordFlag := runCmd.String("coordinator", "", "Coordinator mode: codex (default: auto-VALIDATE)")
+	coordFlag := runCmd.String("coordinator", "", "Coordinator mode: codex|claude|agy|reasonix|auto")
+	modelFlag := runCmd.String("model", "", "Model override (provider-native name)")
+	effortFlag := runCmd.String("effort", "", "Effort level (low|medium|high)")
 
 	if len(os.Args) < 2 || os.Args[1] != "run" {
-		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--coordinator codex|claude] [--validator <cmd>] [--store <path>]\n")
+		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--coordinator codex|claude|agy|reasonix|auto] [--model <name>] [--effort low|medium|high] [--validator <cmd>] [--store <path>]\n")
 		os.Exit(2)
 	}
 	runCmd.Parse(os.Args[2:])
@@ -53,7 +56,6 @@ func run() error {
 		os.Exit(2)
 	}
 
-	// Store.
 	path := *storePath
 	if path == "" {
 		path = filepath.Join(os.TempDir(), "omni-orchestrator.db")
@@ -68,60 +70,26 @@ func run() error {
 	wt := worktree.New()
 
 	cfg := orchestrator.Config{
-		Repo:      *repo,
-		Task:      *task,
-		Command:   *command,
-		CWD:       *cwd,
-		Validator: *validator,
-		StorePath: path,
+		Repo: *repo, Task: *task, Command: *command,
+		CWD: *cwd, Validator: *validator, StorePath: path,
 	}
 
-	// Coordinator wiring (provider-independent).
 	if *coordFlag == "auto" {
-		// OMNI B: performance-based provider routing.
-		router := coordinator.NewRouter(nil) // nil = memory stats (default Codex)
+		router := coordinator.NewRouter(nil)
 		selected := router.SelectCoordinator(*task, *repo)
 		log.Printf("Router: selected %s for task %q", selected, *task)
-		switch selected {
-		case coordinator.ProviderCodex:
-			*coordFlag = "codex"
-		case coordinator.ProviderClaude:
-			*coordFlag = "claude"
+		*coordFlag = string(selected)
+	}
+	if *coordFlag != "" {
+		coord, err := makeCoordinator(*coordFlag, *modelFlag, *effortFlag)
+		if err != nil {
+			log.Printf("Coordinator: %v — falling back to auto-VALIDATE", err)
+		} else if coord != nil {
+			rt := runtime.NewWithID("coordinator-"+*coordFlag, 1)
+			cfg.Coordinator = coordinator.NewCoordinatorRuntime(rt, coord)
 		}
 	}
-	if *coordFlag == "codex" || *coordFlag == "claude" {
-		var coord coordinator.Coordinator
-		id := *coordFlag
-		if *coordFlag == "codex" {
-			if _, err := exec.LookPath("codex"); err != nil {
-				log.Printf("codex not found on PATH — falling back to auto-VALIDATE mode")
-				id = ""
-			} else {
-				coord = coordinator.NewCodexCoordinator()
-			}
-		} else if *coordFlag == "claude" {
-			if _, err := exec.LookPath("claude"); err != nil {
-				log.Printf("claude not found on PATH — falling back to auto-VALIDATE mode")
-				id = ""
-			} else {
-				coord = coordinator.NewClaudeCoordinator()
-			}
-		} else if *coordFlag == "agy" {
-			if _, err := exec.LookPath("agy"); err != nil {
-				log.Printf("agy not found on PATH — falling back to auto-VALIDATE mode")
-				id = ""
-			} else {
-				coord = coordinator.NewAGYCoordinator()
-			}
-		}
-		if id != "" {
-			rt := runtime.NewWithID("coordinator-"+id, 1)
-			cfg.Coordinator = coordinator.NewCoordinatorRuntime(rt, coord)
-			log.Printf("Coordinator: %s", id)
-		}
-	} else if *coordFlag != "" {
-		return fmt.Errorf("unknown coordinator mode: %q (supported: auto, codex, claude, agy)", *coordFlag)
-	} else {
+	if cfg.Coordinator == nil {
 		log.Printf("Coordinator: auto-VALIDATE (no --coordinator flag)")
 	}
 
@@ -136,4 +104,50 @@ func run() error {
 		log.Printf("decisions: %v", decisions)
 	}
 	return err
+}
+
+func makeCoordinator(name, model, effort string) (coordinator.Coordinator, error) {
+	profile := coordinator.DefaultProfile(name)
+	if profile.Provider == "" {
+		return nil, fmt.Errorf("unknown coordinator: %q", name)
+	}
+	if model != "" {
+		profile.Model = model
+	}
+	if effort != "" {
+		profile.Mode = effort
+	}
+
+	switch name {
+	case "codex":
+		if _, err := exec.LookPath("codex"); err != nil {
+			return nil, err
+		}
+		c := coordinator.NewCodexCoordinator()
+		c.ApplyProfile(profile)
+		return c, nil
+	case "claude":
+		if _, err := exec.LookPath("claude"); err != nil {
+			return nil, err
+		}
+		c := coordinator.NewClaudeCoordinator()
+		c.ApplyProfile(profile)
+		return c, nil
+	case "agy":
+		if _, err := exec.LookPath("agy"); err != nil {
+			return nil, err
+		}
+		c := coordinator.NewAGYCoordinator()
+		c.ApplyProfile(profile)
+		return c, nil
+	case "reasonix":
+		if _, err := exec.LookPath("reasonix"); err != nil {
+			return nil, err
+		}
+		c := coordinator.NewReasonixCoordinator()
+		c.ApplyProfile(profile)
+		return c, nil
+	default:
+		return nil, fmt.Errorf("unknown coordinator: %q", name)
+	}
 }
