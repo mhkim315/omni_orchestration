@@ -164,7 +164,7 @@ func TestSelectCoordinatorByName(t *testing.T) {
 
 func TestProviderNames(t *testing.T) {
 	names := ProviderNames()
-	if len(names) != 2 {
-		t.Errorf("expected 2 providers, got %d", len(names))
+	if len(names) != 3 {
+		t.Errorf("expected 3 providers, got %d: %v", len(names), names)
 	}
 }

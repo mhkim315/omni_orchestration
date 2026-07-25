@@ -106,6 +106,13 @@ func run() error {
 			} else {
 				coord = coordinator.NewClaudeCoordinator()
 			}
+		} else if *coordFlag == "agy" {
+			if _, err := exec.LookPath("agy"); err != nil {
+				log.Printf("agy not found on PATH — falling back to auto-VALIDATE mode")
+				id = ""
+			} else {
+				coord = coordinator.NewAGYCoordinator()
+			}
 		}
 		if id != "" {
 			rt := runtime.NewWithID("coordinator-"+id, 1)
@@ -113,7 +120,7 @@ func run() error {
 			log.Printf("Coordinator: %s", id)
 		}
 	} else if *coordFlag != "" {
-		return fmt.Errorf("unknown coordinator mode: %q (supported: auto, codex, claude)", *coordFlag)
+		return fmt.Errorf("unknown coordinator mode: %q (supported: auto, codex, claude, agy)", *coordFlag)
 	} else {
 		log.Printf("Coordinator: auto-VALIDATE (no --coordinator flag)")
 	}

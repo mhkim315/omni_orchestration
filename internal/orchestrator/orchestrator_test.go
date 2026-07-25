@@ -255,6 +255,69 @@ exit 0
 	os.Remove("/tmp/omni-fake-claude-calls")
 }
 
+// TestBlackBoxAGYCoordinator validates the same contract as Codex/Claude
+// but with a fake agy binary. Proves provider-independence (3rd provider).
+func TestBlackBoxAGYCoordinator(t *testing.T) {
+	fakeAGYDir, err := os.MkdirTemp("", "omni-fake-agy-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(fakeAGYDir)
+
+	fakeAGYPath := filepath.Join(fakeAGYDir, "agy")
+	fakeAGYScript := `#!/bin/bash
+CALL_FILE="/tmp/omni-fake-agy-calls"
+CALL_COUNT=1
+if [ -f "$CALL_FILE" ]; then
+	CALL_COUNT=$(($(cat "$CALL_FILE") + 1))
+fi
+echo "$CALL_COUNT" > "$CALL_FILE"
+case $CALL_COUNT in
+	1) echo '{"decision":"VALIDATE","reason":"starting","next_instruction":"write the test file"}' ;;
+	2) echo '{"decision":"COMPLETE","reason":"validator passed","next_instruction":""}' ;;
+	*) echo '{"decision":"FAIL","reason":"too many calls","next_instruction":""}' ;;
+esac
+exit 0
+`
+	os.WriteFile(fakeAGYPath, []byte(fakeAGYScript), 0755)
+
+	repoDir, _ := os.MkdirTemp("", "omni-agy-e2e-*")
+	defer os.RemoveAll(repoDir)
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "e2e@o")
+	runGit(t, repoDir, "config", "user.name", "T")
+	os.WriteFile(filepath.Join(repoDir, "R.md"), []byte("# T"), 0644)
+	runGit(t, repoDir, "add", "R.md")
+	runGit(t, repoDir, "commit", "-m", "init")
+
+	store, _ := taskstore.NewInMemory()
+	defer store.Close()
+
+	agyCoord := coordinator.NewAGYCoordinator()
+	agyCoord.Bin = fakeAGYPath
+	rt := runtime.NewWithID("coordinator-agy", 1)
+	cr := coordinator.NewCoordinatorRuntime(rt, agyCoord)
+
+	cfg := Config{
+		Repo: repoDir, Task: "write test", Command: "echo 'hello from worker' > output.txt",
+		CWD: "", Validator: "grep -q 'hello from worker' output.txt", MaxAttempts: 2,
+		Coordinator: cr,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	decisions, err := Run(ctx, cfg, store, worktree.New())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	t.Logf("agy decisions: %v", decisions)
+	if decisions[len(decisions)-1] != DecisionComplete {
+		t.Errorf("final = %s, want COMPLETE", decisions[len(decisions)-1])
+	}
+	os.Remove("/tmp/omni-fake-agy-calls")
+}
+
 // ── Helpers ──
 
 func runGit(t *testing.T, dir string, args ...string) {

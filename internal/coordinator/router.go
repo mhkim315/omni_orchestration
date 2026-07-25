@@ -12,6 +12,7 @@ type ProviderID string
 const (
 	ProviderCodex  ProviderID = "codex"
 	ProviderClaude ProviderID = "claude"
+	ProviderAGY    ProviderID = "agy"
 )
 
 // ProviderStats holds aggregate stats for one provider.
@@ -131,12 +132,14 @@ func SelectCoordinatorByName(name string) (ProviderID, Coordinator, error) {
 		return ProviderCodex, NewCodexCoordinator(), nil
 	case "claude":
 		return ProviderClaude, NewClaudeCoordinator(), nil
+	case "agy":
+		return ProviderAGY, NewAGYCoordinator(), nil
 	default:
-		return "", nil, fmt.Errorf("unknown coordinator: %q (supported: codex, claude)", name)
+		return "", nil, fmt.Errorf("unknown coordinator: %q (supported: codex, claude, agy)", name)
 	}
 }
 
 // ProviderNames returns the list of supported provider names.
 func ProviderNames() []string {
-	return []string{"codex", "claude"}
+	return []string{"codex", "claude", "agy"}
 }

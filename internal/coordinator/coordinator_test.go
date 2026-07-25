@@ -584,6 +584,66 @@ func TestProviderSwap_SameContract(t *testing.T) {
 	}
 }
 
+// ── OMNI: AGY Coordinator contract tests ──
+
+func TestAGYCoordinator_ImplementsInterface(t *testing.T) {
+	var _ Coordinator = NewAGYCoordinator()
+}
+
+func TestAGYCoordinator_DecisionParsing(t *testing.T) {
+	tests := []struct {
+		output   string
+		expected Decision
+	}{
+		{`{"decision":"VALIDATE","reason":"go","next_instruction":"run validator"}`, DecisionValidate},
+		{`{"decision":"COMPLETE","reason":"done","next_instruction":""}`, DecisionComplete},
+		{`{"decision":"RETRY_CLEAN","reason":"retry","next_instruction":"try again"}`, DecisionRetryClean},
+		{`{"decision":"FAIL","reason":"broken","next_instruction":"stop"}`, DecisionFail},
+		{`not json at all`, DecisionFail},
+		{`{"decision":"UNKNOWN"}`, DecisionFail},
+	}
+
+	for _, tt := range tests {
+		result, _ := parseAGYDecision(tt.output)
+		if result.Decision != tt.expected {
+			t.Errorf("parseAGYDecision(%q) = %s, want %s", tt.output, result.Decision, tt.expected)
+		}
+	}
+}
+
+func TestAGYCoordinator_NextInstructionPreserved(t *testing.T) {
+	result, _ := parseAGYDecision(`{"decision":"RETRY_CLEAN","reason":"retry","next_instruction":"write correct output"}`)
+	if result.NextInstruction != "write correct output" {
+		t.Errorf("NextInstruction = %q, want %q", result.NextInstruction, "write correct output")
+	}
+}
+
+func TestSelectCoordinatorByName_AGY(t *testing.T) {
+	id, coord, err := SelectCoordinatorByName("agy")
+	if err != nil {
+		t.Fatalf("agy: %v", err)
+	}
+	if id != ProviderAGY {
+		t.Errorf("id = %s, want agy", id)
+	}
+	if coord == nil {
+		t.Error("coordinator is nil")
+	}
+}
+
+func TestProviderNames_IncludesAGY(t *testing.T) {
+	names := ProviderNames()
+	found := false
+	for _, n := range names {
+		if n == "agy" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("ProviderNames missing agy: %v", names)
+	}
+}
+
 // ── Helpers ──
 
 func runGit(t *testing.T, dir string, args ...string) {
