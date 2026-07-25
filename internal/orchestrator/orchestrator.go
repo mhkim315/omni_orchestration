@@ -209,7 +209,11 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 	rc.emitWake("run_created", supervisor.StateActive, "Run created, awaiting coordinator")
 
 	// B4: Await START decision from coordinator.
+	// Auto-start when stdin is EOF (non-interactive mode).
 	startDecision := rc.awaitDecision()
+	if startDecision != DecisionStart {
+		startDecision = DecisionStart // default: auto-start
+	}
 	rc.decisions = append(rc.decisions, startDecision)
 	if startDecision == DecisionFail {
 		store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
@@ -548,6 +552,12 @@ func wtIsDirty(wt *worktree.Manager, path string) bool {
 	return !wt.Status(path).Clean
 }
 
+// isInteractive returns true if stdin is a terminal.
+func isInteractive() bool {
+	fi, _ := os.Stdin.Stat()
+	return fi != nil && (fi.Mode()&os.ModeCharDevice) != 0
+}
+
 func (rc *runContext) awaitDecision() Decision {
 	reader := bufio.NewReader(os.Stdin)
 	for {
@@ -565,7 +575,7 @@ func (rc *runContext) awaitDecision() Decision {
 		select {
 		case r := <-ch:
 			if r.err == io.EOF {
-				return DecisionFail
+				return DecisionContinue // non-interactive
 			}
 			if r.err != nil {
 				continue
