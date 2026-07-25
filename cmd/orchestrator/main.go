@@ -76,8 +76,8 @@ func run() error {
 
 	if *coordFlag == "auto" {
 		router := coordinator.NewRouter(nil)
-		selected := router.SelectCoordinator(*task, *repo)
-		log.Printf("Router: selected %s for task %q", selected, *task)
+		selected := router.SelectCoordinator(*task, *repo, *modelFlag, *effortFlag)
+		log.Printf("Router: selected %s for task %q (model=%s effort=%s)", selected, *task, *modelFlag, *effortFlag)
 		*coordFlag = string(selected)
 	}
 	if *coordFlag != "" {

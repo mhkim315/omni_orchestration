@@ -10,9 +10,10 @@ import (
 type ProviderID string
 
 const (
-	ProviderCodex  ProviderID = "codex"
-	ProviderClaude ProviderID = "claude"
-	ProviderAGY    ProviderID = "agy"
+	ProviderCodex    ProviderID = "codex"
+	ProviderClaude   ProviderID = "claude"
+	ProviderAGY      ProviderID = "agy"
+	ProviderReasonix ProviderID = "reasonix"
 )
 
 // ProviderStats holds aggregate stats for one provider.
@@ -52,7 +53,8 @@ func (s *memoryStatsStore) StatsFor(provider ProviderID) ProviderStats {
 	return s.stats[provider]
 }
 
-// Router selects the best coordinator provider based on performance metrics.
+// Router selects the best coordinator provider based on performance metrics,
+// model compatibility, and effort preferences.
 type Router struct {
 	store     StatsStore
 	defaultID ProviderID
@@ -63,35 +65,127 @@ func NewRouter(store StatsStore) *Router {
 	return &Router{store: store, defaultID: ProviderCodex}
 }
 
-// SelectCoordinator returns the best provider for the given task category and repo.
-// Scoring formula:
-//
-//	score = success_rate * 0.4 + reject_score * 0.3 + time_score * 0.2 + repo_fit * 0.1
-//
-// Where:
-//   - success_rate = successes / total_attempts (0 if no attempts)
-//   - reject_score = 1.0 - (total_rejects / total_attempts) (1.0 if no attempts)
-//   - time_score = normalized inverse of avg time (1.0 if no data)
-//   - repo_fit = min(1.0, repos_matched / 3) (0 if no data)
-//
-// If total_attempts < 3 for all providers, returns the default (Codex).
-// Ties go to Codex.
-func (r *Router) SelectCoordinator(taskCategory, repo string) ProviderID {
-	codexStats := r.store.StatsFor(ProviderCodex)
-	claudeStats := r.store.StatsFor(ProviderClaude)
+// autoEligible returns providers eligible for automatic routing.
+// AGY and Reasonix require >= 3 verified samples before auto-routing.
+func autoEligible() []ProviderID {
+	return []ProviderID{ProviderCodex, ProviderClaude, ProviderAGY, ProviderReasonix}
+}
 
-	// Minimum sample threshold.
-	if codexStats.TotalAttempts < 3 && claudeStats.TotalAttempts < 3 {
+func minAutoSamples(id ProviderID) int {
+	switch id {
+	case ProviderCodex, ProviderClaude:
+		return 3
+	case ProviderAGY, ProviderReasonix:
+		return 3 // require verified samples before auto-routing
+	default:
+		return 3
+	}
+}
+
+// SelectCoordinator returns the best provider for the given task category,
+// repo, and optional model/effort preferences.
+//
+// Scoring formula (v0.5):
+//
+//	score = success_rate * 0.35 + reject_score * 0.25 + time_score * 0.15
+//	      + repo_fit * 0.10 + model_match * 0.10 + effort_match * 0.05
+//
+// Model preference: if --model is specified, providers supporting that
+// model get a +0.10 bonus. Providers that don't support --model are not
+// excluded — they just score lower.
+//
+// If total_attempts < 3 for all eligible providers, returns the default (Codex).
+// Ties go to Codex.
+func (r *Router) SelectCoordinator(taskCategory, repo, model, effort string) ProviderID {
+	candidates := autoEligible()
+	if len(candidates) == 0 {
 		return r.defaultID
 	}
 
-	codexScore := r.score(codexStats)
-	claudeScore := r.score(claudeStats)
-
-	if claudeScore > codexScore {
-		return ProviderClaude
+	type scored struct {
+		id    ProviderID
+		score float64
 	}
-	return ProviderCodex // ties go to Codex
+	var results []scored
+	allBelowThreshold := true
+	var bestID ProviderID
+	var bestScore float64
+
+	// First pass: determine if any candidate meets the threshold.
+	for _, id := range candidates {
+		stats := r.store.StatsFor(id)
+		if stats.TotalAttempts >= minAutoSamples(id) {
+			allBelowThreshold = false
+			break
+		}
+	}
+
+	// Second pass: score. Exclude below-threshold providers when others qualify.
+	for _, id := range candidates {
+		stats := r.store.StatsFor(id)
+		minSamples := minAutoSamples(id)
+
+		if !allBelowThreshold && stats.TotalAttempts < minSamples {
+			continue // excluded — other eligible candidates exist
+		}
+
+		s := r.scoreWithModel(stats, model, effort)
+
+		if s > bestScore || (s == bestScore && id == r.defaultID) {
+			bestScore = s
+			bestID = id
+		}
+		results = append(results, scored{id, s})
+	}
+
+	if allBelowThreshold {
+		// If model is specified, prefer a provider that supports --model.
+		if model != "" {
+			for _, cand := range candidates {
+				if cap := ProviderCapabilities(string(cand)); cap.ModelSelection {
+					return cand
+				}
+			}
+		}
+		return r.defaultID
+	}
+
+	// Ties go to Codex.
+	if bestScore == 0 && bestID == "" {
+		return r.defaultID
+	}
+	return bestID
+}
+
+// scoreWithModel computes score including model/effort match bonuses.
+func (r *Router) scoreWithModel(stats ProviderStats, model, effort string) float64 {
+	base := r.score(stats)
+
+	// Model match: +0.10 if model is specified and provider has ModelSelection.
+	modelBonus := 0.0
+	if model != "" {
+		caps := ProviderCapabilities(string(stats.Provider))
+		if caps.ModelSelection {
+			modelBonus = 0.10
+		}
+	}
+
+	// Effort match: +0.05 if effort is specified and provider supports it.
+	effortBonus := 0.0
+	if effort != "" {
+		caps := ProviderCapabilities(string(stats.Provider))
+		if caps.EffortSelection {
+			effortBonus = 0.05
+		}
+	}
+
+	return base + modelBonus + effortBonus
+}
+
+// SelectCoordinatorSimple is the backward-compatible entry point without
+// model/effort preferences.
+func (r *Router) SelectCoordinatorSimple(taskCategory, repo string) ProviderID {
+	return r.SelectCoordinator(taskCategory, repo, "", "")
 }
 
 func (r *Router) score(stats ProviderStats) float64 {
@@ -99,29 +193,23 @@ func (r *Router) score(stats ProviderStats) float64 {
 		return 0
 	}
 
-	// Success rate (0.0 - 1.0).
 	successRate := float64(stats.Successes) / float64(stats.TotalAttempts)
 
-	// Reject score: fewer rejects = higher score (1.0 - reject_ratio).
 	rejectRatio := float64(stats.TotalRejects) / float64(stats.TotalAttempts)
 	rejectScore := 1.0 - rejectRatio
 
-	// Time score: normalized inverse of average time.
-	// If avg time is 0 (no data), score is 1.0.
-	// Otherwise, score = 1.0 / (1.0 + avg_time_seconds).
 	timeScore := 1.0
 	if stats.TotalTimeMs > 0 && stats.TotalAttempts > 0 {
 		avgSec := float64(stats.TotalTimeMs) / float64(stats.TotalAttempts) / 1000.0
-		timeScore = 1.0 / (1.0 + avgSec/60.0) // normalize: 60s = 0.5
+		timeScore = 1.0 / (1.0 + avgSec/60.0)
 	}
 
-	// Repo fit: 0.0 - 1.0 based on unique repos used.
 	repoFit := float64(stats.ReposMatched) / 3.0
 	if repoFit > 1.0 {
 		repoFit = 1.0
 	}
 
-	return successRate*0.4 + rejectScore*0.3 + timeScore*0.2 + repoFit*0.1
+	return successRate*0.35 + rejectScore*0.25 + timeScore*0.15 + repoFit*0.10
 }
 
 // SelectCoordinatorByName returns the Coordinator implementation for a
@@ -134,12 +222,14 @@ func SelectCoordinatorByName(name string) (ProviderID, Coordinator, error) {
 		return ProviderClaude, NewClaudeCoordinator(), nil
 	case "agy":
 		return ProviderAGY, NewAGYCoordinator(), nil
+	case "reasonix":
+		return ProviderReasonix, NewReasonixCoordinator(), nil
 	default:
-		return "", nil, fmt.Errorf("unknown coordinator: %q (supported: codex, claude, agy)", name)
+		return "", nil, fmt.Errorf("unknown coordinator: %q (supported: codex, claude, agy, reasonix)", name)
 	}
 }
 
 // ProviderNames returns the list of supported provider names.
 func ProviderNames() []string {
-	return []string{"codex", "claude", "agy"}
+	return []string{"codex", "claude", "agy", "reasonix"}
 }
