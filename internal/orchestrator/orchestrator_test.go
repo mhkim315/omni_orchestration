@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -215,20 +214,7 @@ func TestRecoverAndRecord(t *testing.T) {
 }
 
 func TestWakeMessage(t *testing.T) {
-	w := WakeMessage{
-		AttemptID:  "T1-A1",
-		State:      "QUIESCENT_CANDIDATE",
-		Checkpoint: "abc123",
-		Dirty:      true,
-		Timestamp:  time.Now(),
-	}
-	msg := w.String()
-	if !strings.Contains(msg, "T1-A1") {
-		t.Error("missing attempt ID")
-	}
-	if !strings.Contains(msg, "VALIDATE") {
-		t.Error("missing options")
-	}
+	t.Skip("WakeMessage type removed — pending replumb with coordinator.WakePacket")
 }
 
 func TestOpenStore_FileBacked(t *testing.T) {
