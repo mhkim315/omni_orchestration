@@ -237,7 +237,9 @@ func (r *Runtime) Interrupt(generation int64) error {
 }
 
 // Close terminates the child process and waits for it to exit.
-// It sends SIGTERM, waits up to graceful seconds, then SIGKILL.
+// It closes the PTY (SIGHUP), cancels the context, and waits for
+// watchExit to report. If the process doesn't exit within the grace
+// period, SIGKILL is sent.
 // Close is idempotent — repeated calls are safe.
 // generation must match (no zero bypass except via Stop alias).
 func (r *Runtime) Close(ctx context.Context, generation int64) error {
@@ -261,12 +263,22 @@ func (r *Runtime) Close(ctx context.Context, generation int64) error {
 	done := r.done
 	r.mu.Unlock()
 
-	// Close PTY first — this sends SIGHUP to the child if it's reading.
+	// If already exited, return immediately — don't close PTY
+	// (the process already captured its exit code). Use a short
+	// timeout to avoid racing with watchExit's done close.
+	select {
+	case <-done:
+		return nil
+	case <-time.After(200 * time.Millisecond):
+		// Not exited yet — proceed with PTY close.
+	}
+
+	// Close PTY — sends SIGHUP to the child if it's reading.
 	if ptmx != nil {
 		ptmx.Close()
 	}
 
-	// Cancel the context to stop output reader.
+	// Cancel context to stop output reader.
 	if cancel != nil {
 		cancel()
 	}
@@ -274,16 +286,6 @@ func (r *Runtime) Close(ctx context.Context, generation int64) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-
-	// If already exited, don't signal a potentially recycled PID.
-	select {
-	case <-done:
-		return nil
-	default:
-	}
-
-	// Send SIGTERM first.
-	signalProcessGroup(cmd.Process.Pid, syscall.SIGTERM)
 
 	graceful := 5 * time.Second
 	if ctx != nil {
@@ -294,7 +296,6 @@ func (r *Runtime) Close(ctx context.Context, generation int64) error {
 		}
 	}
 
-	// Wait for exit.
 	select {
 	case <-done:
 		return nil

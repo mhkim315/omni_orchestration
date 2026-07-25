@@ -61,7 +61,7 @@ func Recover(ctx context.Context, worker *runtime.Runtime, cfg RecoveryConfig, w
 	if worker != nil {
 		closeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		if err := worker.Close(closeCtx, 0); err != nil {
+		if err := worker.Stop(closeCtx); err != nil {
 			result.Error = fmt.Sprintf("worker close: %v", err)
 			return result
 		}
