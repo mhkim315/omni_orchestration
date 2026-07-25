@@ -308,24 +308,37 @@ func TestD_RecordAndQueryRun(t *testing.T) {
 }
 
 func TestD_MultipleProviders(t *testing.T) {
-	s, _ := NewInMemory(); defer s.Close()
+	s, _ := NewInMemory()
+	defer s.Close()
 
 	// 2 runs for claude, 2 for codex.
-	s.CreateRun(); s.RecordRun(1, "claude", "claude-5", "primary", "bug_fix", "repo")
-	s.RecordAttemptOutcome(1, 1, true, 3000); s.RecordAdoption(1, 1, true)
-	s.CreateRun(); s.RecordRun(2, "claude", "claude-5", "primary", "bug_fix", "repo")
-	s.RecordAttemptOutcome(2, 1, true, 3000); s.RecordAdoption(2, 1, true)
+	s.CreateRun()
+	s.RecordRun(1, "claude", "claude-5", "primary", "bug_fix", "repo")
+	s.RecordAttemptOutcome(1, 1, true, 3000)
+	s.RecordAdoption(1, 1, true)
+	s.CreateRun()
+	s.RecordRun(2, "claude", "claude-5", "primary", "bug_fix", "repo")
+	s.RecordAttemptOutcome(2, 1, true, 3000)
+	s.RecordAdoption(2, 1, true)
 
-	s.CreateRun(); s.RecordRun(3, "codex", "gpt-5", "primary", "bug_fix", "repo")
-	s.RecordAttemptOutcome(3, 1, true, 4000); s.RecordAdoption(3, 1, true)
-	s.CreateRun(); s.RecordRun(4, "codex", "gpt-5", "primary", "bug_fix", "repo")
-	s.RecordAttemptOutcome(4, 1, true, 5000); s.RecordAdoption(4, 1, true)
+	s.CreateRun()
+	s.RecordRun(3, "codex", "gpt-5", "primary", "bug_fix", "repo")
+	s.RecordAttemptOutcome(3, 1, true, 4000)
+	s.RecordAdoption(3, 1, true)
+	s.CreateRun()
+	s.RecordRun(4, "codex", "gpt-5", "primary", "bug_fix", "repo")
+	s.RecordAttemptOutcome(4, 1, true, 5000)
+	s.RecordAdoption(4, 1, true)
 
 	claude, _ := s.GetProviderStats("claude", "bug_fix")
-	if claude.TotalRuns != 2 { t.Errorf("claude total = %d", claude.TotalRuns) }
+	if claude.TotalRuns != 2 {
+		t.Errorf("claude total = %d", claude.TotalRuns)
+	}
 
 	codex, _ := s.GetProviderStats("codex", "bug_fix")
-	if codex.TotalRuns != 2 { t.Errorf("codex total = %d", codex.TotalRuns) }
+	if codex.TotalRuns != 2 {
+		t.Errorf("codex total = %d", codex.TotalRuns)
+	}
 
 	best, bestStats, _ := s.GetBestProvider("bug_fix", "repo")
 	t.Logf("Best: %s conf=%s rate=%f", best, bestStats.Confidence, bestStats.SuccessRate)

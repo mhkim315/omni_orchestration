@@ -77,6 +77,18 @@ func run() error {
 	}
 
 	// Coordinator wiring (provider-independent).
+	if *coordFlag == "auto" {
+		// OMNI B: performance-based provider routing.
+		router := coordinator.NewRouter(nil) // nil = memory stats (default Codex)
+		selected := router.SelectCoordinator(*task, *repo)
+		log.Printf("Router: selected %s for task %q", selected, *task)
+		switch selected {
+		case coordinator.ProviderCodex:
+			*coordFlag = "codex"
+		case coordinator.ProviderClaude:
+			*coordFlag = "claude"
+		}
+	}
 	if *coordFlag == "codex" || *coordFlag == "claude" {
 		var coord coordinator.Coordinator
 		id := *coordFlag
@@ -101,7 +113,7 @@ func run() error {
 			log.Printf("Coordinator: %s", id)
 		}
 	} else if *coordFlag != "" {
-		return fmt.Errorf("unknown coordinator mode: %q (supported: codex, claude)", *coordFlag)
+		return fmt.Errorf("unknown coordinator mode: %q (supported: auto, codex, claude)", *coordFlag)
 	} else {
 		log.Printf("Coordinator: auto-VALIDATE (no --coordinator flag)")
 	}
