@@ -43,7 +43,7 @@ func run() error {
 	coordFlag := runCmd.String("coordinator", "", "Coordinator mode: codex (default: auto-VALIDATE)")
 
 	if len(os.Args) < 2 || os.Args[1] != "run" {
-		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--coordinator codex] [--validator <cmd>] [--store <path>]\n")
+		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--coordinator codex|claude] [--validator <cmd>] [--store <path>]\n")
 		os.Exit(2)
 	}
 	runCmd.Parse(os.Args[2:])
@@ -76,18 +76,32 @@ func run() error {
 		StorePath: path,
 	}
 
-	// Fix 1: Codex coordinator wiring.
-	if *coordFlag == "codex" {
-		if _, err := exec.LookPath("codex"); err != nil {
-			log.Printf("codex not found on PATH — falling back to auto-VALIDATE mode")
-		} else {
-			codexCoord := coordinator.NewCodexCoordinator()
-			rt := runtime.NewWithID("coordinator-codex", 1)
-			cfg.Coordinator = coordinator.NewCoordinatorRuntime(rt, codexCoord)
-			log.Printf("Coordinator: codex (auto-VALIDATE if codex unavailable)")
+	// Coordinator wiring (provider-independent).
+	if *coordFlag == "codex" || *coordFlag == "claude" {
+		var coord coordinator.Coordinator
+		id := *coordFlag
+		if *coordFlag == "codex" {
+			if _, err := exec.LookPath("codex"); err != nil {
+				log.Printf("codex not found on PATH — falling back to auto-VALIDATE mode")
+				id = ""
+			} else {
+				coord = coordinator.NewCodexCoordinator()
+			}
+		} else if *coordFlag == "claude" {
+			if _, err := exec.LookPath("claude"); err != nil {
+				log.Printf("claude not found on PATH — falling back to auto-VALIDATE mode")
+				id = ""
+			} else {
+				coord = coordinator.NewClaudeCoordinator()
+			}
+		}
+		if id != "" {
+			rt := runtime.NewWithID("coordinator-"+id, 1)
+			cfg.Coordinator = coordinator.NewCoordinatorRuntime(rt, coord)
+			log.Printf("Coordinator: %s", id)
 		}
 	} else if *coordFlag != "" {
-		return fmt.Errorf("unknown coordinator mode: %q (supported: codex)", *coordFlag)
+		return fmt.Errorf("unknown coordinator mode: %q (supported: codex, claude)", *coordFlag)
 	} else {
 		log.Printf("Coordinator: auto-VALIDATE (no --coordinator flag)")
 	}

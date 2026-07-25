@@ -191,6 +191,70 @@ exit 0
 	os.Remove("/tmp/omni-fake-codex-calls")
 }
 
+// TestBlackBoxClaudeCoordinator validates the same contract as Codex
+// but with a fake claude binary. Proves provider-independence.
+func TestBlackBoxClaudeCoordinator(t *testing.T) {
+	fakeClaudeDir, err := os.MkdirTemp("", "omni-fake-claude-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(fakeClaudeDir)
+
+	fakeClaudePath := filepath.Join(fakeClaudeDir, "claude")
+	fakeClaudeScript := `#!/bin/bash
+CALL_FILE="/tmp/omni-fake-claude-calls"
+CALL_COUNT=1
+if [ -f "$CALL_FILE" ]; then
+	CALL_COUNT=$(($(cat "$CALL_FILE") + 1))
+fi
+echo "$CALL_COUNT" > "$CALL_FILE"
+case $CALL_COUNT in
+	1) echo '{"decision":"VALIDATE","reason":"starting","next_instruction":"write the test file"}' ;;
+	2) echo '{"decision":"RETRY_CLEAN","reason":"failed validation","next_instruction":"try writing output.txt with correct content"}' ;;
+	3) echo '{"decision":"COMPLETE","reason":"validator passed","next_instruction":""}' ;;
+	*) echo '{"decision":"FAIL","reason":"too many calls","next_instruction":""}' ;;
+esac
+exit 0
+`
+	os.WriteFile(fakeClaudePath, []byte(fakeClaudeScript), 0755)
+
+	repoDir, _ := os.MkdirTemp("", "omni-claude-e2e-*")
+	defer os.RemoveAll(repoDir)
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "e2e@o")
+	runGit(t, repoDir, "config", "user.name", "T")
+	os.WriteFile(filepath.Join(repoDir, "R.md"), []byte("# T"), 0644)
+	runGit(t, repoDir, "add", "R.md")
+	runGit(t, repoDir, "commit", "-m", "init")
+
+	store, _ := taskstore.NewInMemory()
+	defer store.Close()
+
+	claudeCoord := coordinator.NewClaudeCoordinator()
+	claudeCoord.Bin = fakeClaudePath
+	rt := runtime.NewWithID("coordinator-claude", 1)
+	cr := coordinator.NewCoordinatorRuntime(rt, claudeCoord)
+
+	cfg := Config{
+		Repo: repoDir, Task: "write test", Command: "echo 'hello from worker' > output.txt",
+		CWD: "", Validator: "grep -q 'hello from worker' output.txt", MaxAttempts: 2,
+		Coordinator: cr,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	decisions, err := Run(ctx, cfg, store, worktree.New())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	t.Logf("claude decisions: %v", decisions)
+	if decisions[len(decisions)-1] != DecisionComplete {
+		t.Errorf("final = %s, want COMPLETE", decisions[len(decisions)-1])
+	}
+	os.Remove("/tmp/omni-fake-claude-calls")
+}
+
 // ── Helpers ──
 
 func runGit(t *testing.T, dir string, args ...string) {
