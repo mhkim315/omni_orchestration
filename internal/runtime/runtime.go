@@ -2,10 +2,10 @@
 // launched in a pseudo-terminal with generation-gated I/O, exactly-once exit
 // reporting, and safe concurrent access.
 //
-// Contracts (inspired by POKIT, not copied):
+// Contracts:
 //   - Every Runtime instance owns one generation (monotonic, immutable after Start).
-//   - Stale writers are rejected: Write after Stop returns ErrRuntimeClosed.
-//   - ExitEvent is delivered exactly once via a channel closed on process exit.
+//   - Stale writers are rejected: Write/Interrupt/Stop after Close returns ErrRuntimeClosed.
+//   - ExitEvent is stored once and readable by any number of Wait callers.
 //   - All exported methods are safe for concurrent use.
 package runtime
 
@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,6 +30,9 @@ var ErrRuntimeClosed = errors.New("runtime: closed")
 // ErrRuntimeNotStarted is returned when an operation is attempted before Start.
 var ErrRuntimeNotStarted = errors.New("runtime: not started")
 
+// ErrStaleGeneration is returned when the generation does not match the current runtime.
+var ErrStaleGeneration = errors.New("runtime: stale generation")
+
 // ExitEvent is delivered exactly once when the child process exits.
 type ExitEvent struct {
 	ExitCode int
@@ -39,24 +43,25 @@ type ExitEvent struct {
 
 // Runtime manages a single PTY child process.
 type Runtime struct {
-	mu         sync.Mutex
-	cmd        *exec.Cmd
-	ptmx       *os.File // PTY master (our end)
-	generation int64
-	started    bool
-	closed     bool
+	mu      sync.Mutex
+	cmd     *exec.Cmd
+	ptmx    *os.File // PTY master (our end)
+	gen     int64
+	id      string
+	started bool
+	closed  bool
 
-	// exitEvent is closed exactly once when the child exits.
-	exitEvent chan ExitEvent
-	exitOnce  sync.Once
-	exitVal   ExitEvent
+	// done is closed exactly once when the child exits.
+	done     chan struct{}
+	doneOnce sync.Once
+	exitVal  ExitEvent
 
 	// output is the line-buffered reader goroutine channel.
 	output    chan string
 	outputCtx context.CancelFunc
 	outputWg  sync.WaitGroup
 
-	// ctx is cancelled on Stop.
+	// ctx is cancelled on Close.
 	ctx    context.Context
 	cancel context.CancelFunc
 }
@@ -64,8 +69,22 @@ type Runtime struct {
 // New creates an unstarted Runtime.
 func New() *Runtime {
 	return &Runtime{
-		exitEvent: make(chan ExitEvent),
+		done: make(chan struct{}),
 	}
+}
+
+// NewWithID creates an unstarted Runtime with a caller-assigned identity.
+func NewWithID(id string) *Runtime {
+	r := New()
+	r.id = id
+	return r
+}
+
+// ID returns the runtime identity.
+func (r *Runtime) ID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.id
 }
 
 // Start spawns the command in a PTY. The working directory may be empty
@@ -87,31 +106,46 @@ func (r *Runtime) Start(command string, cwd string) error {
 		cwd = "/"
 	}
 
-	// Validate cwd exists.
 	if fi, err := os.Stat(cwd); err != nil || !fi.IsDir() {
 		return fmt.Errorf("runtime: cwd does not exist or is not a directory: %s", cwd)
 	}
 
 	r.ctx, r.cancel = context.WithCancel(context.Background())
+	r.gen++
 
-	cmd := exec.CommandContext(r.ctx, "bash", "-c", command)
+	cmd := exec.Command("bash", "-c", command)
 	cmd.Dir = cwd
-	// Own process group so Signal reaches the child and its descendants.
-	// Setpgid places the child in its own process group so Signal reaches
-	// descendants. Omitted for now — ad-hoc-signed test binaries on macOS
-	// may be restricted from posix_spawn with new process groups.
-	// TODO: re-enable when signing is configured.
-	cmd.SysProcAttr = &syscall.SysProcAttr{}
+
+	// Place the child in its own process group so signalProcessGroup
+	// reaches descendants. Setpgid may be restricted on ad-hoc-signed
+	// test binaries (macOS); in that case direct signaling applies.
+	//
+	// We try with Setpgid; if the platform rejects it, we discard the
+	// first cmd (Start may have partially executed) and retry without.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 24, Cols: 80})
 	if err != nil {
-		r.cancel()
-		return fmt.Errorf("runtime: pty start: %w", err)
+		// Platform restriction — retry without Setpgid.
+		// We intentionally discard the first cmd; StartWithSize guarantees
+		// that if it returns an error, the child was not spawned.
+		cmd2 := exec.Command("bash", "-c", command)
+		cmd2.Dir = cwd
+		cmd2.SysProcAttr = &syscall.SysProcAttr{}
+		ptmx, err = pty.StartWithSize(cmd2, &pty.Winsize{Rows: 24, Cols: 80})
+		if err != nil {
+			r.cancel()
+			return fmt.Errorf("runtime: pty start: %w", err)
+		}
+		r.cmd = cmd2
+		r.ptmx = ptmx
+	} else {
+		r.cmd = cmd
+		r.ptmx = ptmx
 	}
 
 	r.cmd = cmd
 	r.ptmx = ptmx
-	r.generation++
 	r.started = true
 
 	// Start the output reader goroutine.
@@ -127,9 +161,9 @@ func (r *Runtime) Start(command string, cwd string) error {
 	return nil
 }
 
-// Write sends data to the PTY. Returns ErrRuntimeClosed if the runtime is
-// stopped, ErrRuntimeNotStarted if not yet started.
-func (r *Runtime) Write(input []byte) (int, error) {
+// Write sends data to the PTY. The generation must match the current runtime.
+// Returns ErrRuntimeClosed if stopped, ErrStaleGeneration if generation mismatches.
+func (r *Runtime) Write(generation int64, input []byte) (int, error) {
 	r.mu.Lock()
 	if !r.started {
 		r.mu.Unlock()
@@ -138,6 +172,10 @@ func (r *Runtime) Write(input []byte) (int, error) {
 	if r.closed {
 		r.mu.Unlock()
 		return 0, ErrRuntimeClosed
+	}
+	if generation != 0 && generation != r.gen {
+		r.mu.Unlock()
+		return 0, ErrStaleGeneration
 	}
 	ptmx := r.ptmx
 	r.mu.Unlock()
@@ -148,7 +186,6 @@ func (r *Runtime) Write(input []byte) (int, error) {
 
 	n, err := ptmx.Write(input)
 	if err != nil {
-		// If the PTY is closed, treat as closed runtime.
 		if errors.Is(err, io.ErrClosedPipe) || errors.Is(err, os.ErrClosed) {
 			return n, ErrRuntimeClosed
 		}
@@ -163,22 +200,38 @@ func (r *Runtime) Observe() <-chan string {
 }
 
 // Interrupt sends SIGINT to the child process group.
-func (r *Runtime) Interrupt() error {
+// The generation must match the current runtime.
+func (r *Runtime) Interrupt(generation int64) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if !r.started || r.closed || r.cmd == nil || r.cmd.Process == nil {
+	if !r.started || r.cmd == nil || r.cmd.Process == nil {
+		return ErrRuntimeClosed
+	}
+	if generation != 0 && generation != r.gen {
+		return ErrStaleGeneration
+	}
+	if r.closed {
 		return ErrRuntimeClosed
 	}
 	return signalProcessGroup(r.cmd.Process.Pid, syscall.SIGINT)
 }
 
-// Stop terminates the child process and waits for it to exit.
+// Close terminates the child process and waits for it to exit.
 // It sends SIGTERM, waits up to graceful seconds, then SIGKILL.
-// Stop is idempotent — repeated calls are safe.
-func (r *Runtime) Stop(ctx context.Context) error {
+// Close is idempotent — repeated calls are safe.
+// The generation must match the current runtime.
+func (r *Runtime) Close(ctx context.Context, generation int64) error {
 	r.mu.Lock()
-	if !r.started || r.closed {
+	if !r.started {
+		r.mu.Unlock()
+		return nil // idempotent
+	}
+	if generation != 0 && generation != r.gen {
+		r.mu.Unlock()
+		return ErrStaleGeneration
+	}
+	if r.closed {
 		r.mu.Unlock()
 		return nil // idempotent
 	}
@@ -186,7 +239,7 @@ func (r *Runtime) Stop(ctx context.Context) error {
 	cmd := r.cmd
 	ptmx := r.ptmx
 	cancel := r.cancel
-	exitCh := r.exitEvent
+	done := r.done
 	r.mu.Unlock()
 
 	// Close PTY first — this sends SIGHUP to the child if it's reading.
@@ -215,15 +268,15 @@ func (r *Runtime) Stop(ctx context.Context) error {
 		}
 	}
 
-	// Wait for exit event (fired exactly once by watchExit when cmd.Wait returns).
+	// Wait for exit.
 	select {
-	case <-exitCh:
+	case <-done:
 		return nil
 	case <-time.After(graceful):
 		// Force kill.
 		signalProcessGroup(cmd.Process.Pid, syscall.SIGKILL)
 		select {
-		case <-exitCh:
+		case <-done:
 			return nil
 		case <-time.After(2 * time.Second):
 			return errors.New("runtime: failed to stop process after SIGKILL")
@@ -231,22 +284,29 @@ func (r *Runtime) Stop(ctx context.Context) error {
 	}
 }
 
-// Wait blocks until the child process exits. Returns the ExitEvent.
-// Safe to call concurrently; all callers receive the same event.
-func (r *Runtime) Wait() ExitEvent {
-	return <-r.exitEvent
+// Stop is an alias for Close (backward compatibility).
+func (r *Runtime) Stop(ctx context.Context) error {
+	return r.Close(ctx, 0)
 }
 
-// ExitEvent returns the exit event channel. It is closed exactly once.
-func (r *Runtime) ExitEvent() <-chan ExitEvent {
-	return r.exitEvent
+// Wait blocks until the child process exits. Returns the stored ExitEvent.
+// Safe to call concurrently; all callers receive the same event.
+func (r *Runtime) Wait() ExitEvent {
+	<-r.done
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.exitVal
+}
+
+// ExitEvent returns a channel that is closed when the child exits.
+// Use Wait() to get the stored ExitEvent value.
+func (r *Runtime) ExitEvent() <-chan struct{} {
+	return r.done
 }
 
 // Generation returns the current (immutable after Start) generation.
 func (r *Runtime) Generation() int64 {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.generation
+	return atomic.LoadInt64(&r.gen)
 }
 
 // ── Internal ──
@@ -269,7 +329,6 @@ func (r *Runtime) readOutput(ctx context.Context, rdr io.Reader) {
 					select {
 					case r.output <- string(line):
 					default:
-						// Channel full — drop oldest to stay bounded.
 					}
 					line = line[:0]
 				} else if b != '\r' {
@@ -278,7 +337,6 @@ func (r *Runtime) readOutput(ctx context.Context, rdr io.Reader) {
 			}
 		}
 		if err != nil {
-			// Flush remaining partial line.
 			if len(line) > 0 {
 				select {
 				case r.output <- string(line):
@@ -295,18 +353,9 @@ func (r *Runtime) watchExit() {
 	if cmd == nil {
 		return
 	}
-	defer func() {
-		r.mu.Lock()
-		r.closed = true
-		if r.ptmx != nil {
-			r.ptmx.Close()
-		}
-		r.mu.Unlock()
-	}()
+	cmd.Wait()
 
-	err := cmd.Wait()
-
-	// Cancel context.
+	// Cancel context to stop output reader.
 	if r.cancel != nil {
 		r.cancel()
 	}
@@ -314,32 +363,34 @@ func (r *Runtime) watchExit() {
 		r.outputCtx()
 	}
 
-	// Close PTY to unblock the output reader, then drain it.
+	// Close PTY to unblock the output reader.
+	r.mu.Lock()
 	if r.ptmx != nil {
 		r.ptmx.Close()
 	}
+	r.closed = true
+	r.mu.Unlock()
 
 	// Drain output reader.
 	r.outputWg.Wait()
 	close(r.output)
 
+	// Build the exit event. Use ProcessState.ExitCode() when available
+	// (Go 1.12+), falling back to WaitStatus for signal detection.
 	ev := ExitEvent{ExitedAt: time.Now()}
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			if status, ok := exitErr.Sys().(syscall.WaitStatus); ok {
-				if status.Signaled() {
-					ev.Signaled = true
-					ev.Signal = status.Signal()
-				}
-				ev.ExitCode = status.ExitStatus()
+	if cmd.ProcessState != nil {
+		ev.ExitCode = cmd.ProcessState.ExitCode()
+		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); ok {
+			if ws.Signaled() {
+				ev.Signaled = true
+				ev.Signal = ws.Signal()
 			}
 		}
 	}
 
-	r.exitOnce.Do(func() {
+	r.doneOnce.Do(func() {
 		r.exitVal = ev
-		close(r.exitEvent)
+		close(r.done)
 	})
 }
 
@@ -347,7 +398,7 @@ func signalProcessGroup(pid int, sig syscall.Signal) error {
 	if pid <= 0 {
 		return nil
 	}
-	// Try process-group signal first (negative PID), fall back to direct signal.
+	// Try process-group signal first (negative PID), fall back to direct.
 	if err := syscall.Kill(-pid, sig); err != nil {
 		return syscall.Kill(pid, sig)
 	}

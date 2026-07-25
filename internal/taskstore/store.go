@@ -165,7 +165,7 @@ func (s *Store) migrate() error {
 	);
 	CREATE TABLE IF NOT EXISTS event_acks (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		event_id INTEGER NOT NULL REFERENCES events(id),
+		event_id INTEGER NOT NULL UNIQUE REFERENCES events(id),
 		acked_at TEXT NOT NULL DEFAULT (datetime('now'))
 	);
 	`

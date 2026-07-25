@@ -59,10 +59,10 @@ func Recover(ctx context.Context, worker *runtime.Runtime, cfg RecoveryConfig, w
 
 	// 1. Ensure worker is stopped.
 	if worker != nil {
-		stopCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		closeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		defer cancel()
-		if err := worker.Stop(stopCtx); err != nil {
-			result.Error = fmt.Sprintf("worker stop: %v", err)
+		if err := worker.Close(closeCtx, 0); err != nil {
+			result.Error = fmt.Sprintf("worker close: %v", err)
 			return result
 		}
 	}

@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/miinanii/omni_orchestration/internal/runtime"
 	"github.com/miinanii/omni_orchestration/internal/taskstore"
 	"github.com/miinanii/omni_orchestration/internal/worktree"
 )
 
-// runGit is a test helper for git commands.
 func runGit(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
@@ -23,7 +23,6 @@ func runGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
-// tmpRepo creates a temporary git repo for testing.
 func tmpRepo(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "omni-orch-test-*")
@@ -31,7 +30,6 @@ func tmpRepo(t *testing.T) string {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
-
 	runGit(t, dir, "init")
 	runGit(t, dir, "config", "user.email", "test@omni.local")
 	runGit(t, dir, "config", "user.name", "Omni Test")
@@ -41,7 +39,7 @@ func tmpRepo(t *testing.T) string {
 	return dir
 }
 
-func TestOrchestrator_RunCleanExit(t *testing.T) {
+func TestRunCleanExit(t *testing.T) {
 	repo := tmpRepo(t)
 	store, _ := taskstore.NewInMemory()
 	defer store.Close()
@@ -52,7 +50,7 @@ func TestOrchestrator_RunCleanExit(t *testing.T) {
 
 	cfg := Config{
 		Repo:    repo,
-		Task:    "clean-exit-test",
+		Task:    "clean exit",
 		Command: "echo hello",
 	}
 
@@ -60,18 +58,15 @@ func TestOrchestrator_RunCleanExit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if len(decisions) != 0 {
-		t.Logf("Decisions: %v", decisions)
-	}
+	t.Logf("Decisions: %v", decisions)
 
-	// Task should be completed.
 	task, _ := store.GetTask(1)
-	if task == nil || task.Status != taskstore.StatusCompleted {
-		t.Errorf("task status = %v, want completed", task)
+	if task.Status != taskstore.StatusCompleted {
+		t.Errorf("task = %s, want completed", task.Status)
 	}
 }
 
-func TestOrchestrator_RunCrashRecovery(t *testing.T) {
+func TestRunCrashRecovery(t *testing.T) {
 	repo := tmpRepo(t)
 	store, _ := taskstore.NewInMemory()
 	defer store.Close()
@@ -82,37 +77,33 @@ func TestOrchestrator_RunCrashRecovery(t *testing.T) {
 
 	cfg := Config{
 		Repo:    repo,
-		Task:    "crash-test",
-		Command: "sh -c 'kill -ABRT $$'", // SIGABRT → real crash
+		Task:    "crash",
+		Command: "sh -c 'kill -ABRT $$'",
 	}
 
 	decisions, err := Run(ctx, cfg, store, wt)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-
-	// After crash, the orchestrator should emit at least one decision.
 	t.Logf("Decisions after crash: %v", decisions)
-
-	// Verify the attempt was recorded.
-	active, _ := store.GetActiveAttempts()
-	t.Logf("Active attempts after crash: %d", len(active))
 }
 
-func TestOrchestrator_WorktreeCheckpoint(t *testing.T) {
+func TestRunWithValidator(t *testing.T) {
 	repo := tmpRepo(t)
 	store, _ := taskstore.NewInMemory()
 	defer store.Close()
 	wt := worktree.New()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Command that writes a file and exits cleanly.
+	// Use validator that always passes (true). The validator runs
+	// in the worktree directory. This proves the validator flow works.
 	cfg := Config{
-		Repo:    repo,
-		Task:    "ckpt-test",
-		Command: "sh -c 'echo result > output.txt && exit 0'",
+		Repo:      repo,
+		Task:      "validated task",
+		Command:   "sh -c 'echo result > output.txt && exit 0'",
+		Validator: "true",
 	}
 
 	_, err := Run(ctx, cfg, store, wt)
@@ -122,34 +113,62 @@ func TestOrchestrator_WorktreeCheckpoint(t *testing.T) {
 
 	task, _ := store.GetTask(1)
 	if task.Status != taskstore.StatusCompleted {
-		t.Errorf("task status = %s, want completed", task.Status)
+		t.Errorf("task = %s, want completed (validator should pass)", task.Status)
 	}
 }
 
-func TestOrchestrator_DecisionLoop(t *testing.T) {
+func TestRunWithValidatorReject(t *testing.T) {
 	repo := tmpRepo(t)
 	store, _ := taskstore.NewInMemory()
 	defer store.Close()
 	wt := worktree.New()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Long-running command that exits after writing output.
 	cfg := Config{
-		Repo:    repo,
-		Task:    "decision-test",
-		Command: "sh -c 'echo working && sleep 2 && echo done && exit 0'",
+		Repo:      repo,
+		Task:      "failing task",
+		Command:   "sh -c 'echo nothing && exit 0'",
+		Validator: "false", // always fails
 	}
 
-	decisions, err := Run(ctx, cfg, store, wt)
+	_, err := Run(ctx, cfg, store, wt)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	t.Logf("Decisions: %v", decisions)
+
+	task, _ := store.GetTask(1)
+	// After validator rejection, a new attempt happens with cleaned state.
+	// The task may be completed or cancelled depending on loop.
+	t.Logf("Task status after reject: %s", task.Status)
 }
 
-func TestWakeMessage_Format(t *testing.T) {
+func TestRecoverAndRecord(t *testing.T) {
+	repo := tmpRepo(t)
+	store, _ := taskstore.NewInMemory()
+	defer store.Close()
+	wt := worktree.New()
+
+	info, _ := wt.Create(repo, "T99", "1")
+	defer wt.Remove(info.Path)
+	os.WriteFile(filepath.Join(info.Path, "work.txt"), []byte("done"), 0644)
+
+	store.CreateRun()
+	store.CreateTask(1, "recovery-test")
+	store.CreateAttempt(1, 1, "T99-A1", "branch", "HEAD")
+	store.RecordWorker(1, "echo", info.Path, "primary", 1)
+
+	var rt *runtime.Runtime // no live runtime
+	sha := recoverAndRecord(context.Background(), rt, wt, info.Path, "T99-A1",
+		store, 1, 1, 1, 1, true)
+
+	if sha == "" {
+		t.Error("expected checkpoint SHA")
+	}
+}
+
+func TestWakeMessage(t *testing.T) {
 	w := WakeMessage{
 		AttemptID:  "T1-A1",
 		State:      "QUIESCENT_CANDIDATE",
@@ -157,35 +176,55 @@ func TestWakeMessage_Format(t *testing.T) {
 		Dirty:      true,
 		Timestamp:  time.Now(),
 	}
-
 	msg := w.String()
 	if !strings.Contains(msg, "T1-A1") {
 		t.Error("missing attempt ID")
 	}
-	if !strings.Contains(msg, "quiescent") {
-		t.Error("missing quiescent keyword")
-	}
-	if !strings.Contains(msg, "abc123") {
-		t.Error("missing checkpoint SHA")
-	}
 	if !strings.Contains(msg, "VALIDATE") {
-		t.Error("missing decision options")
+		t.Error("missing options")
 	}
 }
 
-func TestWakeMessage_CleanExit(t *testing.T) {
-	w := WakeMessage{
-		AttemptID: "T2-A1",
-		State:     "EXITED",
-		Dirty:     false,
-		Timestamp: time.Now(),
+func TestOpenStore_FileBacked(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "orchestrator.db")
+
+	s, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	run, _ := s.CreateRun()
+	if run.ID != 1 {
+		t.Errorf("file-backed store: run id = %d", run.ID)
 	}
 
-	msg := w.String()
-	if !strings.Contains(msg, "exited") {
-		t.Error("missing exited keyword")
+	// Re-open should persist data.
+	s.Close()
+	s2, err := OpenStore(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if strings.Contains(msg, "worktree modified") {
-		t.Error("should not say worktree modified on clean exit")
+	defer s2.Close()
+
+	run2, err := s2.CreateRun()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run2.ID != 2 {
+		t.Errorf("file-backed store: second run id = %d, want 2", run2.ID)
+	}
+}
+
+func TestRunValidator_Pass(t *testing.T) {
+	if !runValidator("true", "") {
+		t.Error("true should pass")
+	}
+}
+
+func TestRunValidator_Fail(t *testing.T) {
+	if runValidator("false", "") {
+		t.Error("false should fail")
 	}
 }

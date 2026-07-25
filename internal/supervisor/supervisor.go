@@ -129,24 +129,16 @@ func (s *Supervisor) Observe(ctx context.Context, rt *runtime.Runtime) <-chan St
 		}
 
 		outputCh := rt.Observe()
-		exitCh := rt.ExitEvent()
+		exitDone := rt.ExitEvent()
 
-		// Bootstrap: if the runtime already exited, the exit channel is
-		// closed. A successful non-blocking receive means the event is
-		// waiting; a closed channel means the runtime already exited.
+		// Bootstrap: if the runtime already exited, the done channel is
+		// already closed. A non-blocking receive on a closed channel
+		// succeeds immediately.
 		select {
-		case ev, ok := <-exitCh:
-			if ok {
-				exited = true
-				exitCode = ev.ExitCode
-			}
-			// ok==false means the channel is closed: runtime already exited.
-			// Use the ExitEvent from Wait() which is always available.
-			if !ok {
-				ev := rt.Wait()
-				exited = true
-				exitCode = ev.ExitCode
-			}
+		case <-exitDone:
+			ev := rt.Wait()
+			exited = true
+			exitCode = ev.ExitCode
 		default:
 		}
 
@@ -178,15 +170,11 @@ func (s *Supervisor) Observe(ctx context.Context, rt *runtime.Runtime) <-chan St
 					lastOutput = time.Now()
 					emit(StateActive)
 				}
-				// If output channel is closed, the runtime is exiting.
-				// Fall through to the exit check on the next tick.
 
-			case ev, ok := <-exitCh:
-				if ok {
-					exited = true
-					exitCode = ev.ExitCode
-				}
-				// Runtime exited — emit terminal state.
+			case <-exitDone:
+				ev := rt.Wait()
+				exited = true
+				exitCode = ev.ExitCode
 				if exitCode == 0 {
 					emit(StateExited)
 				} else {

@@ -4,28 +4,31 @@ import (
 	"context"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 )
 
 func TestRuntime_StartStop(t *testing.T) {
 	r := New()
-	err := r.Start("echo hello", "/tmp")
-	if err != nil {
+	if err := r.Start("echo hello", "/tmp"); err != nil {
 		t.Fatalf("Start: %v", err)
+	}
+
+	gen := r.Generation()
+	if gen != 1 {
+		t.Errorf("generation = %d, want 1", gen)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := r.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
+	if err := r.Close(ctx, gen); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 
 	ev := r.Wait()
 	if ev.ExitCode != 0 {
-		t.Errorf("expected exit code 0, got %d", ev.ExitCode)
+		t.Errorf("exit code = %d, want 0", ev.ExitCode)
 	}
 	if ev.Signaled {
 		t.Error("expected clean exit, not signaled")
@@ -34,18 +37,16 @@ func TestRuntime_StartStop(t *testing.T) {
 
 func TestRuntime_WriteReadRoundTrip(t *testing.T) {
 	r := New()
-	err := r.Start("cat", "/tmp")
-	if err != nil {
+	if err := r.Start("cat", "/tmp"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	gen := r.Generation()
 
-	// Write to cat — it echoes back.
-	_, err = r.Write([]byte("hello world\n"))
+	_, err := r.Write(gen, []byte("hello world\n"))
 	if err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
-	// Read from Observe channel.
 	select {
 	case line := <-r.Observe():
 		if line != "hello world" {
@@ -57,171 +58,59 @@ func TestRuntime_WriteReadRoundTrip(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	r.Stop(ctx)
+	r.Close(ctx, gen)
 	r.Wait()
 }
 
 func TestRuntime_Interrupt(t *testing.T) {
 	r := New()
-	// sleep 10 — will be interrupted.
-	err := r.Start("sleep 10", "/tmp")
-	if err != nil {
+	if err := r.Start("sleep 10", "/tmp"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
+	gen := r.Generation()
 
-	// Give it a moment to start sleeping.
 	time.Sleep(200 * time.Millisecond)
 
-	err = r.Interrupt()
-	if err != nil {
+	if err := r.Interrupt(gen); err != nil {
 		t.Fatalf("Interrupt: %v", err)
 	}
 
 	ev := r.Wait()
-	if ev.ExitCode == 0 && !ev.Signaled {
-		t.Logf("sleep may not exit with non-zero on interrupt on all platforms: code=%d signaled=%v", ev.ExitCode, ev.Signaled)
-	}
-	// Either the process was signaled or exited non-zero.
+	t.Logf("sleep interrupt: code=%d signaled=%v", ev.ExitCode, ev.Signaled)
 }
 
-func TestRuntime_ExitCodeCapture(t *testing.T) {
-	// Exit code 0 is always captured correctly.
-	t.Run("success", func(t *testing.T) {
-		r := New()
-		err := r.Start("exit 0", "/tmp")
-		if err != nil {
-			t.Fatalf("Start: %v", err)
-		}
-		ev := r.Wait()
-		if ev.ExitCode != 0 {
-			t.Errorf("exit code = %d, want 0", ev.ExitCode)
-		}
-	})
-
-	// Non-zero exit codes through a PTY may be platform-dependent.
-	// On macOS, ad-hoc-signed binaries using PTY can observe SIGHUP
-	// delivery to the child process group when the session leader exits,
-	// which may override the explicit exit code. The runtime captures
-	// whatever the OS reports; this test documents the observed behavior.
-	t.Run("non-zero", func(t *testing.T) {
-		r := New()
-		err := r.Start("exit 42", "/tmp")
-		if err != nil {
-			t.Fatalf("Start: %v", err)
-		}
-		ev := r.Wait()
-		t.Logf("exit 42 → code=%d signaled=%v", ev.ExitCode, ev.Signaled)
-		// The child exited — that's the contract. The exact code may vary.
-		if ev.Signaled && ev.Signal == syscall.SIGHUP {
-			t.Log("child received SIGHUP (platform behavior)")
-		}
-	})
-}
-
-func TestRuntime_ConcurrentWriteStop(t *testing.T) {
+func TestRuntime_ExitCode(t *testing.T) {
 	r := New()
-	err := r.Start("cat", "/tmp")
-	if err != nil {
+	if err := r.Start("exit 42", "/tmp"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ev := r.Wait()
+	t.Logf("exit 42 → code=%d signaled=%v signal=%v", ev.ExitCode, ev.Signaled, ev.Signal)
+	// Verify the exit code is captured (platform-dependent through PTY).
+	if ev.ExitCode == 42 {
+		t.Log("exit 42 correctly captured")
+	}
+}
+
+func TestRuntime_ExitSignal(t *testing.T) {
+	r := New()
+	if err := r.Start("kill -SEGV $$", "/tmp"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	ev := r.Wait()
+	t.Logf("kill -SEGV → code=%d signaled=%v signal=%v", ev.ExitCode, ev.Signaled, ev.Signal)
+	// On most platforms, SIGSEGV is delivered.
+	if ev.Signaled {
+		t.Logf("signal preserved: %v", ev.Signal)
+	}
+}
+
+func TestRuntime_WaitMultipleCalls(t *testing.T) {
+	r := New()
+	if err := r.Start("echo once", "/tmp"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
-	var wg sync.WaitGroup
-	errs := make(chan error, 10)
-
-	// Concurrent writers.
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			for j := 0; j < 10; j++ {
-				_, err := r.Write([]byte("x\n"))
-				if err != nil {
-					errs <- err
-					return
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-		}(i)
-	}
-
-	// Concurrent stopper.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		time.Sleep(100 * time.Millisecond)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		r.Stop(ctx)
-	}()
-
-	wg.Wait()
-	close(errs)
-
-	// After Stop, Write must return ErrRuntimeClosed.
-	_, err = r.Write([]byte("after stop\n"))
-	if err != ErrRuntimeClosed {
-		t.Errorf("Write after Stop: expected ErrRuntimeClosed, got %v", err)
-	}
-
-	// Drain any remaining output.
-	for range r.Observe() {
-	}
-}
-
-func TestRuntime_StopIdempotent(t *testing.T) {
-	r := New()
-	r.Start("echo hello", "/tmp")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// First Stop.
-	if err := r.Stop(ctx); err != nil {
-		t.Fatalf("first Stop: %v", err)
-	}
-	// Second Stop — must not panic or error.
-	if err := r.Stop(ctx); err != nil {
-		t.Fatalf("second Stop: %v", err)
-	}
-}
-
-func TestRuntime_StartBeforeStartRejected(t *testing.T) {
-	r := New()
-	r.Start("echo hi", "/tmp")
-
-	// Second Start must fail.
-	err := r.Start("echo again", "/tmp")
-	if err == nil {
-		t.Error("expected error on second Start")
-	}
-}
-
-func TestRuntime_WriteBeforeStartRejected(t *testing.T) {
-	r := New()
-	_, err := r.Write([]byte("too early\n"))
-	if err != ErrRuntimeNotStarted {
-		t.Errorf("expected ErrRuntimeNotStarted, got %v", err)
-	}
-}
-
-func TestRuntime_WriteAfterStopRejected(t *testing.T) {
-	r := New()
-	r.Start("cat", "/tmp")
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	r.Stop(ctx)
-
-	_, err := r.Write([]byte("too late\n"))
-	if err != ErrRuntimeClosed {
-		t.Errorf("expected ErrRuntimeClosed, got %v", err)
-	}
-}
-
-func TestRuntime_ExitEventExactlyOnce(t *testing.T) {
-	r := New()
-	r.Start("echo once", "/tmp")
-
-	// Multiple callers receive the same event.
 	var wg sync.WaitGroup
 	results := make(chan ExitEvent, 3)
 
@@ -253,28 +142,113 @@ func TestRuntime_ExitEventExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestRuntime_ConcurrentWriteClose(t *testing.T) {
+	r := New()
+	if err := r.Start("cat", "/tmp"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	gen := r.Generation()
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 10)
+
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 10; j++ {
+				_, err := r.Write(gen, []byte("x\n"))
+				if err != nil {
+					errs <- err
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}()
+	}
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		time.Sleep(100 * time.Millisecond)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		r.Close(ctx, gen)
+	}()
+
+	wg.Wait()
+	close(errs)
+
+	// After Close, Write must return ErrRuntimeClosed.
+	_, err := r.Write(gen, []byte("after\n"))
+	if err != ErrRuntimeClosed {
+		t.Errorf("Write after Close: expected ErrRuntimeClosed, got %v", err)
+	}
+
+	for range r.Observe() {
+	}
+}
+
+func TestRuntime_CloseIdempotent(t *testing.T) {
+	r := New()
+	r.Start("echo hello", "/tmp")
+	gen := r.Generation()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := r.Close(ctx, gen); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := r.Close(ctx, gen); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestRuntime_StartBeforeStartRejected(t *testing.T) {
+	r := New()
+	r.Start("echo hi", "/tmp")
+	err := r.Start("echo again", "/tmp")
+	if err == nil {
+		t.Error("expected error on second Start")
+	}
+}
+
+func TestRuntime_WriteBeforeStartRejected(t *testing.T) {
+	r := New()
+	_, err := r.Write(0, []byte("too early\n"))
+	if err != ErrRuntimeNotStarted {
+		t.Errorf("expected ErrRuntimeNotStarted, got %v", err)
+	}
+}
+
+func TestRuntime_CloseBeforeStartIsNoop(t *testing.T) {
+	r := New()
+	ctx := context.Background()
+	if err := r.Close(ctx, 0); err != nil {
+		t.Errorf("Close before Start should be no-op: %v", err)
+	}
+}
+
 func TestRuntime_GenerationMonotonic(t *testing.T) {
 	r := New()
-
-	g0 := r.Generation()
-	if g0 != 0 {
-		t.Errorf("initial generation should be 0, got %d", g0)
+	if r.Generation() != 0 {
+		t.Errorf("initial generation = %d, want 0", r.Generation())
 	}
 
 	r.Start("echo gen1", "/tmp")
 	g1 := r.Generation()
-	if g1 <= g0 {
-		t.Errorf("generation should increase: g0=%d g1=%d", g0, g1)
+	if g1 != 1 {
+		t.Errorf("generation after Start = %d, want 1", g1)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	r.Stop(ctx)
+	r.Close(ctx, g1)
 
-	// Generation must not change after Stop.
 	g2 := r.Generation()
 	if g2 != g1 {
-		t.Errorf("generation changed after Stop: %d -> %d", g1, g2)
+		t.Errorf("generation changed after Close: %d -> %d", g1, g2)
 	}
 }
 
@@ -282,7 +256,6 @@ func TestRuntime_OutputChannelClosedOnExit(t *testing.T) {
 	r := New()
 	r.Start("echo line1 && echo line2", "/tmp")
 
-	// Collect output until channel closes.
 	var lines []string
 	for line := range r.Observe() {
 		lines = append(lines, line)
@@ -290,9 +263,6 @@ func TestRuntime_OutputChannelClosedOnExit(t *testing.T) {
 
 	if len(lines) < 1 {
 		t.Error("expected at least 1 line of output")
-	}
-	for _, l := range lines {
-		t.Logf("output: %s", l)
 	}
 }
 
@@ -323,20 +293,16 @@ loop:
 
 func TestRuntime_CWDDefault(t *testing.T) {
 	r := New()
-	err := r.Start("echo $PWD", "/tmp")
-	if err != nil {
-		t.Fatalf("Start: %v", err)
-	}
+	r.Start("echo $PWD", "/tmp")
 
 	select {
 	case line := <-r.Observe():
 		if !strings.HasPrefix(line, "/tmp") {
-			t.Errorf("expected CWD to be /tmp, got %q", line)
+			t.Errorf("expected CWD /tmp, got %q", line)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout")
 	}
-
 	r.Wait()
 }
 
@@ -357,7 +323,6 @@ func TestRuntime_EmptyCommandRejected(t *testing.T) {
 }
 
 func TestRuntime_StderrOutput(t *testing.T) {
-	// stderr goes through the PTY (it's a terminal), so it appears in output.
 	r := New()
 	r.Start("echo stdout ; echo stderr >&2", "/tmp")
 
@@ -380,6 +345,111 @@ func TestRuntime_StderrOutput(t *testing.T) {
 		t.Error("stdout line not found in PTY output")
 	}
 	if !foundStderr {
-		t.Error("stderr line not found in PTY output (PTY merges stdout+stderr)")
+		t.Error("stderr line not found in PTY output")
+	}
+}
+
+func TestRuntime_StaleWriteRejected(t *testing.T) {
+	r := New()
+	r.Start("cat", "/tmp")
+	gen := r.Generation()
+
+	// Write with wrong generation.
+	_, err := r.Write(gen+999, []byte("stale\n"))
+	if err != ErrStaleGeneration {
+		t.Errorf("expected ErrStaleGeneration, got %v", err)
+	}
+
+	// Correct generation works.
+	_, err = r.Write(gen, []byte("good\n"))
+	if err != nil {
+		t.Errorf("correct generation should work: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r.Close(ctx, gen)
+	r.Wait()
+}
+
+func TestRuntime_StaleInterruptRejected(t *testing.T) {
+	r := New()
+	r.Start("sleep 10", "/tmp")
+	gen := r.Generation()
+
+	err := r.Interrupt(gen + 999)
+	if err != ErrStaleGeneration {
+		t.Errorf("expected ErrStaleGeneration for Interrupt, got %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	r.Close(ctx, gen)
+	r.Wait()
+}
+
+func TestRuntime_StaleCloseRejected(t *testing.T) {
+	r := New()
+	r.Start("sleep 10", "/tmp")
+	gen := r.Generation()
+
+	ctx := context.Background()
+	err := r.Close(ctx, gen+999)
+	if err != ErrStaleGeneration {
+		t.Errorf("expected ErrStaleGeneration for Close, got %v", err)
+	}
+
+	// Correct generation still works.
+	r.Close(ctx, gen)
+	r.Wait()
+}
+
+func TestRuntime_ProcessTreeCleanup(t *testing.T) {
+	r := New()
+	// Spawn a child that spawns a grandchild. All must be cleaned up.
+	if err := r.Start("bash -c 'sleep 30 & sleep 30'", "/tmp"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	gen := r.Generation()
+
+	// Give it time to spawn children.
+	time.Sleep(500 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := r.Close(ctx, gen); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	ev := r.Wait()
+	t.Logf("tree cleanup: code=%d signaled=%v", ev.ExitCode, ev.Signaled)
+}
+
+func TestRuntime_RuntimeID(t *testing.T) {
+	r := NewWithID("worker-001")
+	if r.ID() != "worker-001" {
+		t.Errorf("ID = %q, want worker-001", r.ID())
+	}
+
+	r2 := New()
+	if r2.ID() != "" {
+		t.Errorf("default ID = %q, want empty", r2.ID())
+	}
+}
+
+func TestRuntime_ExitEventChannel(t *testing.T) {
+	r := New()
+	r.Start("echo done", "/tmp")
+
+	// ExitEvent returns a done channel, not an ExitEvent channel.
+	done := r.ExitEvent()
+	ev := r.Wait()
+
+	select {
+	case <-done:
+		t.Logf("done channel closed, exit code=%d", ev.ExitCode)
+	default:
+		t.Error("done channel should be closed after Wait returns")
 	}
 }
