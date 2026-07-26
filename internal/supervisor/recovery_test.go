@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/miinanii/omni_orchestration/internal/runtime"
-	"github.com/miinanii/omni_orchestration/internal/worktree"
+	"github.com/mhkim315/omni_orchestration/internal/runtime"
+	"github.com/mhkim315/omni_orchestration/internal/worktree"
 )
 
 func runGit(t *testing.T, dir string, args ...string) {

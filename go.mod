@@ -1,4 +1,4 @@
-module github.com/miinanii/omni_orchestration
+module github.com/mhkim315/omni_orchestration
 
 go 1.26.5
 

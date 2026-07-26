@@ -9,7 +9,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/miinanii/omni_orchestration/internal/runtime"
+	"github.com/mhkim315/omni_orchestration/internal/runtime"
 )
 
 // ErrMalformedResponse is returned when the coordinator produces invalid JSON.

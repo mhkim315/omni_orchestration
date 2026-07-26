@@ -34,6 +34,10 @@ type Store struct {
 	// of performing the update. Test hook for exercising the adoption rejection
 	// path through orchestrator.Run().
 	ForceAdoptionError error
+
+	// ForceCandidateError, when non-nil, is returned by RecordCandidate.
+	// Test hook for v1.1.1 candidate rejection path through orchestrator.Run().
+	ForceCandidateError error
 }
 
 // Run represents an orchestrator run.
@@ -228,6 +232,14 @@ func (s *Store) migrate() error {
 			// SQLite error "duplicate column name" is expected on re-run.
 			if !strings.Contains(err.Error(), "duplicate") {
 				return fmt.Errorf("alter workers add %s: %w", col, err)
+			}
+		}
+	}
+	// v1.1.1: candidate_accepted_attempt for user-explicit adoption.
+	for _, col := range []string{"candidate_accepted_attempt"} {
+		if _, err := s.db.Exec("ALTER TABLE run_records ADD COLUMN " + col + " INTEGER NOT NULL DEFAULT 0"); err != nil {
+			if !strings.Contains(err.Error(), "duplicate") {
+				return fmt.Errorf("alter run_records add %s: %w", col, err)
 			}
 		}
 	}
@@ -646,6 +658,35 @@ func (s *Store) RecordAdoption(runID int64, attemptNum int, adopted bool) error 
 		return err
 	}
 	return nil
+}
+
+// RecordCandidate marks an attempt as candidate_accepted (validator passed,
+// coordinator approved). Only user-explicit result adopt sets final_adopted_attempt.
+// v1.1.1 P0: auto-adoption → user-explicit adoption.
+func (s *Store) RecordCandidate(runID int64, attemptNum int) error {
+	// v1.1.1: Test hook for candidate rejection path.
+	if s.ForceCandidateError != nil {
+		return s.ForceCandidateError
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		`UPDATE run_records SET candidate_accepted_attempt=? WHERE run_id=?`,
+		attemptNum, runID,
+	)
+	return err
+}
+
+// GetCandidate returns the candidate_accepted_attempt for a run, or 0 if none.
+func (s *Store) GetCandidate(runID int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int
+	s.db.QueryRow(
+		"SELECT COALESCE(candidate_accepted_attempt,0) FROM run_records WHERE run_id=?",
+		runID,
+	).Scan(&n)
+	return n
 }
 
 // RecordEffect records a durable effect key for a run. Returns false if the

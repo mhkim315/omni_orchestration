@@ -26,19 +26,19 @@ OMNI is a local-first orchestration runtime for terminal-based coding agents. It
 # Install
 git clone https://github.com/mhkim315/omni_orchestration.git
 cd omni_orchestration
-go build ./cmd/orchestrator
+go build ./cmd/omni
 
 # Run your first task
-./orchestrator run \
+./omni run \
   --task "Add unit tests for the login handler" \
   --command claude \
   --coordinator auto \
   --repo /path/to/your/project
 
 # After completion
-./orchestrator result show <run-id>
-./orchestrator result diff <run-id>
-./orchestrator result adopt <run-id>
+./omni result show <run-id>
+./omni result diff <run-id>
+./omni result adopt <run-id>
 ```
 
 ### Supported Providers

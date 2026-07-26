@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miinanii/omni_orchestration/internal/coordinator"
-	"github.com/miinanii/omni_orchestration/internal/runtime"
-	"github.com/miinanii/omni_orchestration/internal/taskstore"
-	"github.com/miinanii/omni_orchestration/internal/worktree"
+	"github.com/mhkim315/omni_orchestration/internal/coordinator"
+	"github.com/mhkim315/omni_orchestration/internal/runtime"
+	"github.com/mhkim315/omni_orchestration/internal/taskstore"
+	"github.com/mhkim315/omni_orchestration/internal/worktree"
 )
 
 // TestRealRestartSubprocess validates that when the orchestrator process is
@@ -25,7 +25,7 @@ import (
 func TestRealRestartSubprocess(t *testing.T) {
 	// Build orchestrator binary.
 	orchBin := filepath.Join(t.TempDir(), "orchestrator")
-	buildCmd := exec.Command("go", "build", "-o", orchBin, "../../cmd/orchestrator")
+	buildCmd := exec.Command("go", "build", "-o", orchBin, "../../cmd/omni")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("build orchestrator: %v\n%s", err, out)
 	}
@@ -126,7 +126,7 @@ func TestRealRestartSubprocess(t *testing.T) {
 // R13 Fix 1: kill orchestrator PID only, prove LIVE attach path.
 func TestRestartWithResumeAttach(t *testing.T) {
 	orchBin := filepath.Join(t.TempDir(), "orchestrator-resume")
-	buildCmd := exec.Command("go", "build", "-o", orchBin, "../../cmd/orchestrator")
+	buildCmd := exec.Command("go", "build", "-o", orchBin, "../../cmd/omni")
 	if out, err := buildCmd.CombinedOutput(); err != nil {
 		t.Fatalf("build orchestrator: %v\n%s", err, out)
 	}
@@ -289,7 +289,7 @@ func TestAdoptionRejectionAllEntities(t *testing.T) {
 
 	// R13 Fix 3: Force RecordAdoption to fail via test hook.
 	// This triggers the production rejection path inside orchestrator.Run().
-	store.ForceAdoptionError = errors.New("adoption rejected by test hook")
+	store.ForceCandidateError = errors.New("candidate rejected by test hook")
 
 	// Mock coordinator: VALIDATE → COMPLETE.
 	mock := coordinator.NewMockCoordinator(DecisionValidate, DecisionComplete)

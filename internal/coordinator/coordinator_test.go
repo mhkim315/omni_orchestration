@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miinanii/omni_orchestration/internal/runtime"
-	"github.com/miinanii/omni_orchestration/internal/supervisor"
-	"github.com/miinanii/omni_orchestration/internal/taskstore"
-	"github.com/miinanii/omni_orchestration/internal/worktree"
+	"github.com/mhkim315/omni_orchestration/internal/runtime"
+	"github.com/mhkim315/omni_orchestration/internal/supervisor"
+	"github.com/mhkim315/omni_orchestration/internal/taskstore"
+	"github.com/mhkim315/omni_orchestration/internal/worktree"
 )
 
 // TestE2E_CoordinatorRetryFlow validates the full managed-coordinator

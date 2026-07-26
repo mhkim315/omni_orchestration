@@ -20,11 +20,11 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/miinanii/omni_orchestration/internal/coordinator"
-	"github.com/miinanii/omni_orchestration/internal/orchestrator"
-	"github.com/miinanii/omni_orchestration/internal/runtime"
-	"github.com/miinanii/omni_orchestration/internal/taskstore"
-	"github.com/miinanii/omni_orchestration/internal/worktree"
+	"github.com/mhkim315/omni_orchestration/internal/coordinator"
+	"github.com/mhkim315/omni_orchestration/internal/orchestrator"
+	"github.com/mhkim315/omni_orchestration/internal/runtime"
+	"github.com/mhkim315/omni_orchestration/internal/taskstore"
+	"github.com/mhkim315/omni_orchestration/internal/worktree"
 )
 
 func main() {
@@ -281,17 +281,29 @@ func resultShow(store *taskstore.Store, target string) error {
 	fmt.Printf("Task: %s\n", task.Title)
 	if rec != nil {
 		fmt.Printf("Provider: %s  Model: %s  Role: %s\n", rec.Provider, rec.Model, rec.Role)
-		fmt.Printf("Duration: %dms  Attempts: %d  Rejects: %d  Adopted: %d\n",
-			rec.DurationMs, rec.AttemptCount, rec.ValidatorRejectCount, rec.FinalAdoptedAttempt)
+		fmt.Printf("Duration: %dms  Attempts: %d  Rejects: %d\n",
+			rec.DurationMs, rec.AttemptCount, rec.ValidatorRejectCount)
+		if rec.FinalAdoptedAttempt > 0 {
+			fmt.Printf("Adopted: attempt %d\n", rec.FinalAdoptedAttempt)
+		}
+		// v1.1.1: show candidate_accepted (separate from adopted).
+		candidate := store.GetCandidate(runID)
+		if candidate > 0 {
+			fmt.Printf("Candidate: attempt %d (validator PASS + coordinator COMPLETE)\n", candidate)
+		}
 	}
 	fmt.Printf("\nAttempts:\n")
 	for _, a := range attempts {
-		adopted := ""
+		marker := ""
 		if rec != nil && rec.FinalAdoptedAttempt == a.Number {
-			adopted = " ★ ADOPTED"
+			marker = " ★ ADOPTED"
+		}
+		candidate := store.GetCandidate(runID)
+		if candidate == a.Number && rec != nil && rec.FinalAdoptedAttempt != a.Number {
+			marker = " ✓ CANDIDATE"
 		}
 		fmt.Printf("  #%d — %s — branch: %s — checkpoint: %s%s\n",
-			a.Number, a.Status, a.Branch, a.CheckpointCommit, adopted)
+			a.Number, a.Status, a.Branch, a.CheckpointCommit, marker)
 	}
 	return nil
 }
@@ -302,31 +314,53 @@ func resultDiff(store *taskstore.Store, target string) error {
 		return err
 	}
 
-	rec, err := store.GetRunRecord(runID)
-	if err != nil {
-		return fmt.Errorf("run record not found: %w", err)
+	// v1.1.1 P1: parse --attempt flag for pre-adoption diff.
+	attemptNum := 0
+	for i, a := range os.Args {
+		if a == "--attempt" && i+1 < len(os.Args) {
+			fmt.Sscanf(os.Args[i+1], "%d", &attemptNum)
+		}
 	}
 
-	if rec.FinalAdoptedAttempt == 0 {
-		return fmt.Errorf("no adopted attempt for run %d — use 'result adopt <attemptID>' first", runID)
-	}
-
-	// Show git diff of the checkpoint commit vs base.
 	tasks, _ := store.GetTasksByRun(runID)
 	if len(tasks) == 0 {
 		return fmt.Errorf("no tasks")
 	}
 	attempts, _ := store.GetAttemptsByTask(tasks[0].ID)
 
-	for _, a := range attempts {
-		if a.Number == rec.FinalAdoptedAttempt && a.CheckpointCommit != "" {
-			cmd := exec.Command("git", "diff", a.BaseCommit, a.CheckpointCommit)
-			cmd.Stdout = os.Stdout
-			cmd.Stderr = os.Stderr
-			return cmd.Run()
+	// Find the target attempt: explicit --attempt, or fall back to adopted.
+	var targetAttempt *taskstore.Attempt
+	if attemptNum > 0 {
+		for _, a := range attempts {
+			if a.Number == attemptNum {
+				targetAttempt = a
+				break
+			}
+		}
+		if targetAttempt == nil {
+			return fmt.Errorf("attempt %d not found in run %d", attemptNum, runID)
+		}
+	} else {
+		rec, _ := store.GetRunRecord(runID)
+		if rec == nil || rec.FinalAdoptedAttempt == 0 {
+			return fmt.Errorf("no adopted attempt for run %d — specify --attempt N or use 'result adopt' first", runID)
+		}
+		for _, a := range attempts {
+			if a.Number == rec.FinalAdoptedAttempt {
+				targetAttempt = a
+				break
+			}
 		}
 	}
-	return fmt.Errorf("adopted attempt has no checkpoint")
+
+	if targetAttempt == nil || targetAttempt.CheckpointCommit == "" {
+		return fmt.Errorf("attempt has no checkpoint to diff")
+	}
+
+	cmd := exec.Command("git", "diff", targetAttempt.BaseCommit, targetAttempt.CheckpointCommit)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func resultAdopt(store *taskstore.Store, target string) error {
@@ -335,7 +369,7 @@ func resultAdopt(store *taskstore.Store, target string) error {
 		return err
 	}
 
-	// R3: parse --attempt flag.
+	// v1.1.1 P1: parse --attempt flag.
 	attemptNum := 0
 	for i, a := range os.Args {
 		if a == "--attempt" && i+1 < len(os.Args) {
@@ -367,7 +401,13 @@ func resultAdopt(store *taskstore.Store, target string) error {
 		chosen = attempts[len(attempts)-1]
 	}
 
-	// R3: verify completed + checkpoint before adopt.
+	// v1.1.1 P1: Adoption all checks.
+	rec, recErr := store.GetRunRecord(runID)
+	if recErr != nil {
+		return fmt.Errorf("no run_record for run %d: %w", runID, recErr)
+	}
+
+	// 1. Verify completed + checkpoint.
 	if chosen.Status != taskstore.StatusCompleted {
 		return fmt.Errorf("attempt %d is %s — must be completed before adopt", chosen.Number, chosen.Status)
 	}
@@ -375,11 +415,28 @@ func resultAdopt(store *taskstore.Store, target string) error {
 		return fmt.Errorf("attempt %d has no checkpoint", chosen.Number)
 	}
 
-	if _, err := store.GetRunRecord(runID); err != nil {
-		return fmt.Errorf("no run_record for run %d: %w", runID, err)
+	// 2. Verify candidate accepted (validator PASS + coordinator COMPLETE).
+	candidate := store.GetCandidate(runID)
+	if candidate == 0 {
+		return fmt.Errorf("run %d has no candidate_accepted — must complete with validator PASS first", runID)
 	}
+	if candidate != chosen.Number {
+		return fmt.Errorf("attempt %d is not the candidate (candidate is %d)", chosen.Number, candidate)
+	}
+
+	// 3. Not already adopted (no duplicate adoption).
+	if rec.FinalAdoptedAttempt > 0 {
+		return fmt.Errorf("run %d already has adopted attempt %d — reject first with 'result reject'", runID, rec.FinalAdoptedAttempt)
+	}
+
+	// 4. Not superseded — candidate must be the latest completed attempt.
+	for _, a := range attempts {
+		if a.Number > chosen.Number && a.Status == taskstore.StatusCompleted {
+			return fmt.Errorf("attempt %d superseded by attempt %d (newer completed)", chosen.Number, a.Number)
+		}
+	}
+
 	if err := store.RecordAdoption(runID, chosen.Number, true); err != nil {
-		// R8 Fix 4: Update ALL entities on adoption failure, not just run.
 		store.UpdateRunStatus(runID, taskstore.StatusFailed)
 		store.UpdateTaskStatus(tasks[0].ID, taskstore.StatusFailed)
 		store.UpdateAttemptStatus(chosen.ID, taskstore.StatusFailed)
@@ -388,7 +445,7 @@ func resultAdopt(store *taskstore.Store, target string) error {
 		}
 		return fmt.Errorf("adopt: %w", err)
 	}
-	// R8 Fix 4: Update ALL entities on successful adoption, not just run_record.
+	// Update ALL entities on successful explicit adoption.
 	store.UpdateRunStatus(runID, taskstore.StatusCompleted)
 	store.UpdateTaskStatus(tasks[0].ID, taskstore.StatusCompleted)
 	store.UpdateAttemptStatus(chosen.ID, taskstore.StatusCompleted)

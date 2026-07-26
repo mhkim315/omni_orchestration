@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/miinanii/omni_orchestration/internal/runtime"
+	"github.com/mhkim315/omni_orchestration/internal/runtime"
 )
 
 func TestSupervisor_ActiveToExited(t *testing.T) {

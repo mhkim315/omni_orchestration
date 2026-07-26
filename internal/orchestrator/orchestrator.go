@@ -16,11 +16,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/miinanii/omni_orchestration/internal/coordinator"
-	"github.com/miinanii/omni_orchestration/internal/runtime"
-	"github.com/miinanii/omni_orchestration/internal/supervisor"
-	"github.com/miinanii/omni_orchestration/internal/taskstore"
-	"github.com/miinanii/omni_orchestration/internal/worktree"
+	"github.com/mhkim315/omni_orchestration/internal/coordinator"
+	"github.com/mhkim315/omni_orchestration/internal/runtime"
+	"github.com/mhkim315/omni_orchestration/internal/supervisor"
+	"github.com/mhkim315/omni_orchestration/internal/taskstore"
+	"github.com/mhkim315/omni_orchestration/internal/worktree"
 )
 
 // Re-export coordinator types so existing callers don't break.
@@ -199,7 +199,7 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		RunID: run.ID, TaskID: task.ID, TaskTitle: cfg.Task,
 		AttemptNumber: 0, AttemptStatus: "pending",
 		WorkerState: "pending", ExitCode: 0,
-		AllowedDecisions: []string{"VALIDATE", "FAIL"},
+		AllowedDecisions: []string{"START", "VALIDATE", "FAIL"},
 	})
 	if err != nil {
 		log.Printf("B-R1: coordinator wake failed: %v — FAIL (R3: fail-closed)", err)
@@ -288,28 +288,34 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		}
 
 		if resp.Decision == DecisionComplete {
-			// R2: Authoritative result adoption — verify run_record exists.
-			if _, err := rc.store.GetRunRecord(rc.runID); err == nil {
-				if err := rc.store.RecordAdoption(rc.runID, attemptNum, true); err != nil {
-					log.Printf("R2: RecordAdoption failed: %v", err)
-					// R10 Fix 4: Update ALL 4 entities on adoption failure.
-					rc.store.UpdateRunStatus(rc.runID, taskstore.StatusFailed)
-					rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusFailed)
-					rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
-					rc.store.UpdateWorkerStatus(ast.worker.ID, taskstore.StatusFailed)
-					return rc.decisions, fmt.Errorf("adoption failed: %w", err)
-				}
-			} else if rc.cfg.Provider != "" {
-				// R9 Fix 2: Adoption fail-closed — missing run_record with known provider.
-				log.Printf("R9: no run_record for run %d (provider=%s) — failing closed", rc.runID, rc.cfg.Provider)
-				// R10 Fix 4: Update ALL 4 entities.
+			// v1.1.1 P0: Mark candidate_accepted, NOT final_adopted_attempt.
+			// Only user-explicit `result adopt` sets final_adopted_attempt.
+			// Gateway validates the state transition.
+			if err := rc.gateway.Validate(result.state, resp.Decision, result.validatorPassed); err != nil {
+				log.Printf("Gateway.Validate rejected COMPLETE: %v — failing closed", err)
 				rc.store.UpdateRunStatus(rc.runID, taskstore.StatusFailed)
 				rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusFailed)
 				rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
 				rc.store.UpdateWorkerStatus(ast.worker.ID, taskstore.StatusFailed)
-				return rc.decisions, fmt.Errorf("adoption impossible: %w", err)
-			} else {
-				log.Printf("R2: no run_record for run %d — skipping adoption (no provider)", rc.runID)
+				return rc.decisions, fmt.Errorf("gateway rejected COMPLETE: %w", err)
+			}
+			// Record candidate (validator-passed + coordinator-approved).
+			if _, err := rc.store.GetRunRecord(rc.runID); err == nil {
+				if err := rc.store.RecordCandidate(rc.runID, attemptNum); err != nil {
+					log.Printf("RecordCandidate failed: %v — failing closed", err)
+					rc.store.UpdateRunStatus(rc.runID, taskstore.StatusFailed)
+					rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusFailed)
+					rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
+					rc.store.UpdateWorkerStatus(ast.worker.ID, taskstore.StatusFailed)
+					return rc.decisions, fmt.Errorf("candidate record failed: %w", err)
+				}
+			} else if rc.cfg.Provider != "" {
+				log.Printf("no run_record for run %d (provider=%s) — failing closed", rc.runID, rc.cfg.Provider)
+				rc.store.UpdateRunStatus(rc.runID, taskstore.StatusFailed)
+				rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusFailed)
+				rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
+				rc.store.UpdateWorkerStatus(ast.worker.ID, taskstore.StatusFailed)
+				return rc.decisions, fmt.Errorf("candidate impossible: %w", err)
 			}
 			rc.finalizeTerminal(ast, taskstore.StatusCompleted)
 			return rc.decisions, nil
