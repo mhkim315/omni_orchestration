@@ -379,8 +379,21 @@ func resultAdopt(store *taskstore.Store, target string) error {
 		return fmt.Errorf("no run_record for run %d: %w", runID, err)
 	}
 	if err := store.RecordAdoption(runID, chosen.Number, true); err != nil {
+		// R8 Fix 4: Update ALL entities on adoption failure, not just run.
 		store.UpdateRunStatus(runID, taskstore.StatusFailed)
+		store.UpdateTaskStatus(tasks[0].ID, taskstore.StatusFailed)
+		store.UpdateAttemptStatus(chosen.ID, taskstore.StatusFailed)
+		if w, wErr := store.GetWorkerByAttempt(chosen.ID); wErr == nil {
+			store.UpdateWorkerStatus(w.ID, taskstore.StatusFailed)
+		}
 		return fmt.Errorf("adopt: %w", err)
+	}
+	// R8 Fix 4: Update ALL entities on successful adoption, not just run_record.
+	store.UpdateRunStatus(runID, taskstore.StatusCompleted)
+	store.UpdateTaskStatus(tasks[0].ID, taskstore.StatusCompleted)
+	store.UpdateAttemptStatus(chosen.ID, taskstore.StatusCompleted)
+	if w, wErr := store.GetWorkerByAttempt(chosen.ID); wErr == nil {
+		store.UpdateWorkerStatus(w.ID, taskstore.StatusCompleted)
 	}
 	fmt.Printf("Run #%d — Attempt #%d adopted \u2713\n", runID, chosen.Number)
 	return nil

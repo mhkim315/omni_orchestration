@@ -88,27 +88,9 @@ func (g *DecisionGateway) Validate(state supervisor.State, decision Decision, va
 	return nil
 }
 
-// IsDuplicate checks both in-memory cache and durable store.
-// Returns true if the effect key has already been processed.
-// R2 Fix 4: durable effect key check in SQLite.
-func (g *DecisionGateway) IsDuplicate(key string) bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if g.seenKeys[key] {
-		return true
-	}
-	if g.store != nil && g.store.HasEffect(g.runID, key) {
-		g.seenKeys[key] = true
-		return true
-	}
-	g.seenKeys[key] = true
-	return false
-}
-
-// RecordEffect persists an effect key to the durable store.
-// R2 Fix 4: durable effect key write to SQLite.
 // RecordEffect atomically records an effect key. Returns true if newly
-// inserted (rowsAffected=1), false if already existed. R7: single INSERT OR IGNORE.
+// inserted (rowsAffected=1), false if already existed.
+// R8: single INSERT OR IGNORE — no separate IsDuplicate check needed.
 func (g *DecisionGateway) RecordEffect(key string) (bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -290,17 +272,16 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		}
 		rc.decisions = append(rc.decisions, resp.Decision)
 
-		// R2 Fix 4: Record durable effect key to prevent replay on restart.
+		// R8 Fix 2: Atomic dedup — single INSERT OR IGNORE, check rowsAffected.
+		// No separate IsDuplicate/HasEffect pre-check (which would race).
 		effectKey := fmt.Sprintf("run-%d-att-%d-decision-%s", rc.runID, attemptNum, resp.Decision)
-		if rc.gateway.IsDuplicate(effectKey) {
-			log.Printf("R2: duplicate effect key %q — skipping decision replay", effectKey)
+		isNew, err := rc.gateway.RecordEffect(effectKey)
+		if err != nil {
+			log.Printf("R8: RecordEffect failed: %v", err)
+		} else if !isNew {
+			log.Printf("R8: duplicate effect key %q — skipping decision replay", effectKey)
 			rc.finalizeTerminal(ast, taskstore.StatusCancelled)
 			return rc.decisions, nil
-		}
-		if isNew, err := rc.gateway.RecordEffect(effectKey); err != nil {
-			log.Printf("R2: RecordEffect failed: %v", err)
-		} else if !isNew {
-			log.Printf("R2: effect key %q already recorded (race)", effectKey)
 		}
 
 		if resp.Decision == DecisionComplete {
@@ -308,8 +289,11 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 			if _, err := rc.store.GetRunRecord(rc.runID); err == nil {
 				if err := rc.store.RecordAdoption(rc.runID, attemptNum, true); err != nil {
 					log.Printf("R2: RecordAdoption failed: %v", err)
+					// R8 Fix 1: Return error WITHOUT finalizeTerminal(COMPLETED).
+					// Leave run/task/attempt as FAILED — don't overwrite.
 					rc.store.UpdateRunStatus(rc.runID, taskstore.StatusFailed)
 					rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
+					return rc.decisions, fmt.Errorf("adoption failed: %w", err)
 				}
 			} else {
 				log.Printf("R2: no run_record for run %d — skipping adoption", rc.runID)
