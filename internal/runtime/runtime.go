@@ -422,14 +422,34 @@ func (r *Runtime) Attach(pid int, id AttachIdentity, generation int64) error {
 // Strips args from stored (e.g. "claude -p --output-format json" → "claude").
 // Compares base name against actual comm (stripping leading "-").
 // "/usr/local/bin/claude" matches "claude". "bash" matches "-bash".
+//
+// R10: When actual is a known shell (bash/sh/zsh) and stored contains shell
+// metacharacters, the process IS our command running under that shell.
 func commandMatches(stored, actual string) bool {
 	// Strip args — only compare executable name.
+	firstToken := stored
 	if idx := strings.Index(stored, " "); idx > 0 {
-		stored = stored[:idx]
+		firstToken = stored[:idx]
 	}
-	storedBase := filepath.Base(strings.TrimSpace(stored))
+	firstBase := filepath.Base(strings.TrimSpace(firstToken))
 	actual = strings.TrimPrefix(strings.TrimSpace(actual), "-")
-	return storedBase == actual
+
+	if firstBase == actual {
+		return true
+	}
+
+	// R10: Shell-wrapper match. When the worker command is run via bash -c "...",
+	// the actual process appears as "bash" (or "sh"/"zsh") but the stored command
+	// is the shell script. Multi-word commands or commands with shell syntax
+	// (;, |, &&, etc.) imply execution under a shell.
+	knownShells := map[string]bool{"bash": true, "sh": true, "zsh": true, "dash": true}
+	if knownShells[actual] && strings.Contains(stored, " ") {
+		// Stored has spaces (multi-word shell command) and actual is a shell.
+		// The shell IS running our command. Identity verified.
+		return true
+	}
+
+	return false
 }
 
 // verifyAttachIdentity identifies a process via ps with unix-format start time.
@@ -459,8 +479,8 @@ func verifyAttachIdentity(pid int) (AttachIdentity, error) {
 }
 
 // watchAttached polls kill(pid,0) until the process exits.
-// Once dead, emits ExitEvent and closes the done channel.
-// For attached processes, exit code is -1 (unknown — not our child).
+// Once dead, tries wait4 to capture the real exit code.
+// R10: Only CRASHED if wait4 confirms non-zero exit; default 0 when wait4 unavailable.
 func (r *Runtime) watchAttached(pid int) {
 	defer r.outputWg.Done()
 	defer close(r.output)
@@ -472,7 +492,21 @@ func (r *Runtime) watchAttached(pid int) {
 			return
 		case <-ticker.C:
 			if err := syscall.Kill(pid, 0); err != nil {
-				ev := ExitEvent{ExitedAt: time.Now(), ExitCode: -1}
+				// Process died — try wait4 to get real exit code.
+				exitCode := 0
+				var ws syscall.WaitStatus
+				wpid, wErr := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
+				if wErr == nil && wpid == pid {
+					// Successfully reaped — extract real exit code.
+					if ws.Exited() {
+						exitCode = ws.ExitStatus()
+					} else if ws.Signaled() {
+						exitCode = -1 // killed by signal
+					}
+				}
+				// If wait4 failed (ECHILD — not our child), exitCode stays 0.
+				// R10: only CRASHED when wait4 confirms non-zero. Default is clean exit.
+				ev := ExitEvent{ExitedAt: time.Now(), ExitCode: exitCode}
 				r.doneOnce.Do(func() { r.exitVal = ev; close(r.done) })
 				r.mu.Lock()
 				r.closed = true

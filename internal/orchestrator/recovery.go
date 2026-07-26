@@ -47,9 +47,19 @@ func Reconcile(store *taskstore.Store, wt *worktree.Manager) ReconcileResult {
 		if a.Status != taskstore.StatusRunning && a.Status != taskstore.StatusPending {
 			continue
 		}
-		// Only mark as interrupted if there's NO checkpoint (never started).
-		// Attempts with checkpoints are re-own candidates, not interrupted.
+		// R10: Preserve for re-own if checkpoint exists OR worker is still alive.
+		// Checkpoint is definitive evidence. Live worker (kill(pid,0) OK) is also
+		// valid — we can re-attach and observe it to completion.
+		liveWorker := false
 		if a.CheckpointCommit == "" {
+			if w, wErr := store.GetWorkerByAttempt(a.ID); wErr == nil && w.PID > 0 {
+				if err := syscall.Kill(w.PID, 0); err == nil {
+					liveWorker = true
+					log.Printf("RECOVERY: attempt %d pid %d alive — preserving for re-own (no checkpoint)", a.ID, w.PID)
+				}
+			}
+		}
+		if a.CheckpointCommit == "" && !liveWorker {
 			// Resolve run/task/worker IDs for full terminalization.
 			taskID := a.TaskID
 			var runID int64
@@ -63,8 +73,8 @@ func Reconcile(store *taskstore.Store, wt *worktree.Manager) ReconcileResult {
 			store.UpdateRunStatus(runID, StatusInterrupted)
 			store.UpdateTaskStatus(taskID, StatusInterrupted)
 			r.Interrupted++
-			log.Printf("RECOVERY: attempt %d (no checkpoint) fully terminalized", a.ID)
-		} else {
+			log.Printf("RECOVERY: attempt %d (no checkpoint, worker dead) fully terminalized", a.ID)
+		} else if a.CheckpointCommit != "" {
 			cpshort := a.CheckpointCommit
 			if len(cpshort) > 8 {
 				cpshort = cpshort[:8]

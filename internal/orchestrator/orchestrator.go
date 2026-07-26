@@ -292,19 +292,21 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 			if _, err := rc.store.GetRunRecord(rc.runID); err == nil {
 				if err := rc.store.RecordAdoption(rc.runID, attemptNum, true); err != nil {
 					log.Printf("R2: RecordAdoption failed: %v", err)
-					// R8 Fix 1: Return error WITHOUT finalizeTerminal(COMPLETED).
-					// Leave run/task/attempt as FAILED — don't overwrite.
+					// R10 Fix 4: Update ALL 4 entities on adoption failure.
 					rc.store.UpdateRunStatus(rc.runID, taskstore.StatusFailed)
+					rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusFailed)
 					rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
+					rc.store.UpdateWorkerStatus(ast.worker.ID, taskstore.StatusFailed)
 					return rc.decisions, fmt.Errorf("adoption failed: %w", err)
 				}
 			} else if rc.cfg.Provider != "" {
-				// R9 Fix 2: Adoption fail-closed — provider was set so run_record
-				// should exist. Missing run_record with known provider = failure.
+				// R9 Fix 2: Adoption fail-closed — missing run_record with known provider.
 				log.Printf("R9: no run_record for run %d (provider=%s) — failing closed", rc.runID, rc.cfg.Provider)
+				// R10 Fix 4: Update ALL 4 entities.
 				rc.store.UpdateRunStatus(rc.runID, taskstore.StatusFailed)
 				rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusFailed)
 				rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
+				rc.store.UpdateWorkerStatus(ast.worker.ID, taskstore.StatusFailed)
 				return rc.decisions, fmt.Errorf("adoption impossible: %w", err)
 			} else {
 				log.Printf("R2: no run_record for run %d — skipping adoption (no provider)", rc.runID)
