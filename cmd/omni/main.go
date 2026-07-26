@@ -67,6 +67,9 @@ func run() error {
 	if os.Args[1] == "providers" {
 		return providersCmd()
 	}
+	if os.Args[1] == "benchmark" {
+		return benchmarkCmd(os.Args[2:])
+	}
 	if os.Args[1] != "run" {
 		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--resume] [--coordinator codex|claude|agy|reasonix|auto] [--model <name>] [--effort low|medium|high] [--validator <cmd>] [--store <path>]\n")
 		os.Exit(2)
@@ -615,5 +618,38 @@ func providersCmd() error {
 			fmt.Printf("  ✗ %s (not found)\n", p)
 		}
 	}
+	return nil
+}
+
+// ── Benchmark subcommand (v2.3) ──
+
+func benchmarkCmd(args []string) error {
+	planFile := ""
+	repo := ""
+	runs := 10
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--plan":
+			if i+1 < len(args) {
+				planFile = args[i+1]
+				i++
+			}
+		case "--repo":
+			if i+1 < len(args) {
+				repo = args[i+1]
+				i++
+			}
+		case "--runs":
+			if i+1 < len(args) {
+				fmt.Sscanf(args[i+1], "%d", &runs)
+				i++
+			}
+		}
+	}
+	if planFile == "" || repo == "" {
+		return fmt.Errorf("usage: omni benchmark run --plan <file> --repo <dir> [--runs 10]")
+	}
+	fmt.Printf("benchmark: plan=%s repo=%s runs=%d\n", planFile, repo, runs)
+	fmt.Printf("  (use 'go test -bench' style or internal/benchmark package)\n")
 	return nil
 }
