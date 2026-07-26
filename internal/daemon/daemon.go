@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/mhkim315/omni_orchestration/internal/dag"
 	"github.com/mhkim315/omni_orchestration/internal/orchestrator"
 	"github.com/mhkim315/omni_orchestration/internal/taskstore"
 	"github.com/mhkim315/omni_orchestration/internal/worktree"
@@ -27,13 +28,14 @@ import (
 // ── Daemon ──
 
 type Daemon struct {
-	cfg    Config
-	store  *taskstore.Store
-	wt     *worktree.Manager
-	srv    *http.Server
-	mu     sync.Mutex
-	runs   map[int64]*orchestrator.Config // active run configs
-	closed bool
+	cfg     Config
+	store   *taskstore.Store
+	wt      *worktree.Manager
+	srv     *http.Server
+	tracker *Tracker
+	mu      sync.Mutex
+	runs    map[int64]*orchestrator.Config // active run configs
+	closed  bool
 }
 
 type Config struct {
@@ -44,6 +46,7 @@ type Config struct {
 	CertFile   string
 	KeyFile    string
 	RepoBase   string
+	DAGPath    string
 }
 
 // New creates a daemon with the given configuration.
@@ -67,6 +70,17 @@ func New(cfg Config) (*Daemon, error) {
 	mux.HandleFunc("/api/resume", d.handleResume)
 	d.srv = &http.Server{Handler: mux}
 
+	// v1.7: Initialize DAG tracker if DAG path is set.
+	if cfg.DAGPath != "" {
+		dagStore, err := dag.New(cfg.DAGPath)
+		if err != nil {
+			store.Close()
+			return nil, fmt.Errorf("daemon dag: %w", err)
+		}
+		orchCfg := orchestrator.Config{Repo: cfg.RepoBase}
+		d.tracker = NewTracker(store, dagStore, d.wt, orchCfg)
+	}
+
 	return d, nil
 }
 
@@ -74,6 +88,12 @@ func New(cfg Config) (*Daemon, error) {
 func (d *Daemon) Start() error {
 	// Resume active runs from store.
 	d.resumeActive()
+
+	// Start tracker if configured.
+	if d.tracker != nil {
+		d.tracker.Start(context.Background())
+		d.tracker.ResumeActiveTasks()
+	}
 
 	// Start HTTP listener.
 	ln, err := d.listen()
@@ -93,6 +113,9 @@ func (d *Daemon) Shutdown(ctx context.Context) error {
 	d.mu.Unlock()
 
 	log.Printf("daemon: shutting down gracefully...")
+	if d.tracker != nil {
+		d.tracker.Close()
+	}
 	return d.srv.Shutdown(ctx)
 }
 
