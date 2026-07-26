@@ -108,8 +108,9 @@ func (c *CoordinatorRuntime) Wake(ctx context.Context, generation int64, pkt Wak
 
 	// Input ACK: assign a monotonic sequence number.
 	seq := atomic.AddInt64(&c.ackSeq, 1)
-	_ = seq // reserved for ACK tracking
+	snapshotGen := generation // capture at call time
 	c.mu.Unlock()
+	_ = seq
 
 	// Call the coordinator with timeout.
 	timeoutCtx, cancel := context.WithTimeout(ctx, c.timeout)
@@ -121,6 +122,11 @@ func (c *CoordinatorRuntime) Wake(ctx context.Context, generation int64, pkt Wak
 			return WakeResponse{}, ErrCoordinatorTimeout
 		}
 		return WakeResponse{}, fmt.Errorf("coordinator decide: %w", err)
+	}
+
+	// C4: reject if generation changed during Decide (old-gen response).
+	if atomic.LoadInt64(&c.gen) != snapshotGen {
+		return WakeResponse{}, ErrStaleCoordinator
 	}
 
 	// Validate the decision against allowed decisions.

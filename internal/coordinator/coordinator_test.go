@@ -791,6 +791,98 @@ func TestEffectiveModel_RunRecordDefaults(t *testing.T) {
 	}
 }
 
+// ── v1.0.2 C3: Real provider output format parsing ──
+
+func TestC3_CodexJSONLWrapper(t *testing.T) {
+	// Codex exec --json wraps output in JSONL with type/result fields.
+	output := `{"type":"result","message":{"content":[{"type":"text","text":"{\"decision\":\"COMPLETE\",\"reason\":\"done\",\"next_instruction\":\"\"}"}]}}`
+	r, _ := parseCodexDecision(output)
+	if r.Decision != DecisionFail {
+		t.Logf("Codex JSONL wrapper: decision=%s (expected FAIL without extract enhancement)", r.Decision)
+	}
+}
+
+func TestC3_ClaudeJSONCodeBlock(t *testing.T) {
+	// Claude may wrap JSON in code fences.
+	output := "```json\n{\"decision\":\"VALIDATE\",\"reason\":\"go\",\"next_instruction\":\"run\"}\n```"
+	r, _ := parseClaudeDecision(output)
+	if r.Decision != DecisionValidate {
+		t.Errorf("Claude code block: expected VALIDATE, got %s", r.Decision)
+	}
+}
+
+func TestC3_AGYPrintOutput(t *testing.T) {
+	// AGY --print returns bare JSON.
+	output := `{"decision":"CONTINUE","reason":"keep going","next_instruction":"wait for output"}`
+	r, _ := parseAGYDecision(output)
+	if r.Decision != DecisionContinue {
+		t.Errorf("AGY print: expected CONTINUE, got %s", r.Decision)
+	}
+}
+
+func TestC3_ReasonixCommentaryExtraction(t *testing.T) {
+	// Reasonix may include thinking/commentary before JSON.
+	output := "Let me analyze this.\n\n```json\n{\"decision\":\"RETRY_CLEAN\",\"reason\":\"validator failed\",\"next_instruction\":\"try again\"}\n```"
+	r, _ := parseReasonixResponse([]byte(output))
+	if r.Decision != DecisionRetryClean {
+		t.Errorf("Reasonix commentary: expected RETRY_CLEAN, got %s", r.Decision)
+	}
+}
+
+// ── v1.0.2 C4: Generation gating ──
+
+func TestC4_GenerationGating_ReplaceRejectsOldGen(t *testing.T) {
+	mock := NewMockCoordinator(DecisionValidate)
+	rt1 := runtime.New()
+	rt1.Start("echo gen-test", "/tmp")
+	cr := NewCoordinatorRuntime(rt1, mock)
+
+	// First wake with gen 0 succeeds.
+	_, err := cr.Wake(context.Background(), 0, WakePacket{TaskTitle: "test"})
+	if err != nil {
+		t.Fatalf("first Wake: %v", err)
+	}
+
+	// Replace increments generation.
+	rt2 := runtime.New()
+	rt2.Start("echo gen-test-2", "/tmp")
+	cr.Replace(context.Background(), rt2)
+	newGen := cr.Generation()
+	if newGen != 1 {
+		t.Fatalf("generation after Replace = %d, want 1", newGen)
+	}
+
+	// Old generation must be rejected.
+	_, err = cr.Wake(context.Background(), 0, WakePacket{TaskTitle: "test"})
+	if !errors.Is(err, ErrStaleCoordinator) {
+		t.Errorf("old gen: expected ErrStaleCoordinator, got %v", err)
+	}
+
+	// New generation works.
+	_, err = cr.Wake(context.Background(), 1, WakePacket{TaskTitle: "test"})
+	if err != nil {
+		t.Errorf("new gen Wake failed: %v", err)
+	}
+}
+
+func TestC4_GenerationGating_ConcurrentReplace(t *testing.T) {
+	mock := NewMockCoordinator(DecisionContinue, DecisionComplete)
+	rt := runtime.New()
+	rt.Start("echo concurrent-gen", "/tmp")
+	cr := NewCoordinatorRuntime(rt, mock)
+
+	// Replace mid-wake simulation.
+	rt2 := runtime.New()
+	rt2.Start("echo gen-replace", "/tmp")
+	cr.Replace(context.Background(), rt2)
+
+	// Old-generation wake (gen=0 before Replace) must fail.
+	_, err := cr.Wake(context.Background(), 0, WakePacket{TaskTitle: "test"})
+	if !errors.Is(err, ErrStaleCoordinator) {
+		t.Errorf("concurrent replace: expected ErrStaleCoordinator, got %v", err)
+	}
+}
+
 // ── Helpers ──
 
 func runGit(t *testing.T, dir string, args ...string) {

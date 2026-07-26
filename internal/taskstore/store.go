@@ -8,6 +8,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -93,6 +94,11 @@ func New(path string) (*Store, error) {
 		return nil, fmt.Errorf("open: %w", err)
 	}
 	db.SetMaxOpenConns(1) // SQLite serializes writes
+
+	// HIGH: SQLite store must be owner-only.
+	if path != ":memory:" {
+		os.Chmod(path, 0600)
+	}
 
 	s := &Store{db: db}
 	if err := s.migrate(); err != nil {

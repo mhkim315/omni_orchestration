@@ -34,7 +34,7 @@ func (c *AGYCoordinator) Decide(ctx context.Context, state RunState) (Result, er
 
 	prompt := buildAGYPrompt(state)
 
-	args := []string{"--print", "--print-timeout", "120s"}
+	args := []string{"--print", "--print-timeout", "120s", "--dangerously-skip-permissions"}
 	if c.Model != "" {
 		args = append(args, "--model", c.Model)
 	}

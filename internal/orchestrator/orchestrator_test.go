@@ -88,7 +88,7 @@ func TestOrchestrator_NoCoordinatorDefaultsToValidate(t *testing.T) {
 
 	cfg := Config{
 		Repo: repoDir, Task: "simple", Command: "echo done > out.txt",
-		CWD: "/tmp", Validator: "grep -q done out.txt", MaxAttempts: 1,
+		CWD: "", Validator: "grep -q done out.txt", MaxAttempts: 1,
 		// No Coordinator — defaults to VALIDATE.
 	}
 

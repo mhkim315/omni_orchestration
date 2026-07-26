@@ -123,12 +123,15 @@ func scanSecrets(worktreePath string, changedFiles []string) (bool, string) {
 		absPath := filepath.Join(worktreePath, relPath)
 		// Skip directories and non-existent files.
 		fi, err := os.Stat(absPath)
-		if err != nil || fi.IsDir() {
+		if err != nil {
+			return true, relPath // HIGH: fail-closed on stat error
+		}
+		if fi.IsDir() {
 			continue
 		}
 		data, err := os.ReadFile(absPath)
 		if err != nil {
-			continue
+			return true, relPath // HIGH: fail-closed on read error
 		}
 		for _, pat := range secretPatterns {
 			if pat.Match(data) {

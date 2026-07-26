@@ -36,7 +36,7 @@ func (c *ClaudeCoordinator) Decide(ctx context.Context, state RunState) (Result,
 
 	prompt := buildClaudePrompt(state)
 
-	args := []string{"-p", "--output-format", "json"}
+	args := []string{"-p", "--output-format", "json", "--permission-mode", "dontAsk"}
 	if c.Model != "" {
 		args = append(args, "--model", c.Model)
 	}

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -134,10 +135,16 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		maxAtts = defaultMaxAttempts
 	}
 
+	// C5: Reconcile active attempts — verify worktree exists before cancelling.
+	// Never kill owner processes; only cancel stale DB records.
 	existing, _ := store.GetActiveAttempts()
 	for _, a := range existing {
-		store.UpdateAttemptStatus(a.ID, taskstore.StatusCancelled)
-		log.Printf("B-R1 recovery: cancelled in-progress attempt %d", a.ID)
+		if a.Branch != "" && !worktreeExists(a.Branch) {
+			log.Printf("C5 recovery: attempt %d branch %q worktree gone — cancelling", a.ID, a.Branch)
+			store.UpdateAttemptStatus(a.ID, taskstore.StatusCancelled)
+		} else {
+			log.Printf("C5 recovery: attempt %d branch %q worktree EXISTS — preserving", a.ID, a.Branch)
+		}
 	}
 
 	run, err := store.CreateRun()
@@ -179,6 +186,8 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 	}
 
 	attemptNum := 1
+	autoValidateCount := 0
+	const maxAutoValidate = 3 // C2: max auto-VALIDATE loops before FAIL
 	baseCommit := "HEAD"
 	// Fix 3: first attempt always receives cfg.Task as the instruction.
 	// Subsequent retries receive coordinator next_instruction + cfg.Task.
@@ -189,6 +198,18 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		case <-ctx.Done():
 			return rc.decisions, ctx.Err()
 		default:
+		}
+
+		// C2: no-coordinator VALIDATE loop guard.
+		if startResp.Decision == DecisionValidate && rc.cfg.Coordinator == nil {
+			autoValidateCount++
+			if autoValidateCount > maxAutoValidate {
+				store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
+				log.Printf("C2: max auto-VALIDATE (%d) exceeded", maxAutoValidate)
+				return rc.decisions, nil
+			}
+		} else {
+			autoValidateCount = 0
 		}
 
 		if attemptNum > maxAtts {
@@ -267,6 +288,11 @@ func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instructi
 	cwd := rc.cfg.CWD
 	if cwd == "" {
 		cwd = info.Path
+	}
+	// C5: Validate CWD is within worktree boundary.
+	if cwd != info.Path && !isWithinWorktree(cwd, info.Path) {
+		rc.wt.Remove(info.Path)
+		return nil, fmt.Errorf("CWD %q is outside worktree %q", cwd, info.Path)
 	}
 	attempt, err := rc.store.CreateAttempt(taskID, num, attemptID, info.Branch, baseCommit)
 	if err != nil {
@@ -439,6 +465,43 @@ func recoverAndRecord(ctx context.Context, rt *runtime.Runtime, wt *worktree.Man
 }
 
 // OpenStore creates a file-backed task store.
+// C5: worktreeExists checks if a git worktree branch directory still exists.
+// C5: isWithinWorktree checks that cwd is inside the worktree path.
+func isWithinWorktree(cwd, wtPath string) bool {
+	rel, err := filepath.Rel(wtPath, cwd)
+	if err != nil {
+		return false
+	}
+	// Must not start with ".." (escapes worktree).
+	return !strings.HasPrefix(rel, "..") && rel != "."
+}
+
+func worktreeExists(branch string) bool {
+	// Worktree branches are stored under .worktrees/ in the repo parent.
+	// A simple check: the branch name contains the worktree path info.
+	// For now, verify via git worktree list.
+	cmd := exec.Command("git", "worktree", "list", "--porcelain")
+	out, err := cmd.Output()
+	if err != nil {
+		return false
+	}
+	return len(out) > 0 && containsStr(string(out), branch)
+}
+
+func containsStr(haystack, needle string) bool {
+	return len(haystack) > 0 && len(needle) > 0 &&
+		(haystack == needle || len(haystack) >= len(needle) && searchHaystack(haystack, needle))
+}
+
+func searchHaystack(h, n string) bool {
+	for i := 0; i <= len(h)-len(n); i++ {
+		if h[i:i+len(n)] == n {
+			return true
+		}
+	}
+	return false
+}
+
 func OpenStore(path string) (*taskstore.Store, error) {
 	return taskstore.New(path)
 }
