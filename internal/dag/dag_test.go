@@ -211,3 +211,91 @@ func TestMultiRepoCrossRepoPartialFailure(t *testing.T) {
 	t.Logf("multi-repo: A=%s B=%s C=%s (partial failure: A failed blocks B, C independent)",
 		a.Repo, b.Repo, c.Repo)
 }
+
+// 7. Two tasks same shared/file.go → serialized (path conflict)
+func TestTwoTasksSameSharedFileSerialized(t *testing.T) {
+	s, _ := NewInMemory()
+	defer s.Close()
+
+	// Both tasks claim ownership of shared/file.go
+	a, _ := s.CreateTaskFull(1, "task-A", 0, "", "echo A", "true", "shared/file.go")
+	b, _ := s.CreateTaskFull(1, "task-B", 0, "", "echo B", "true", "shared/file.go")
+
+	// Acquire path lease for A.
+	okA, _ := s.AcquirePathLease(a.ID, "shared/file.go")
+	if !okA {
+		t.Fatal("A could not acquire shared/file.go")
+	}
+
+	// B tries to acquire same path — should fail (already owned).
+	okB, _ := s.AcquirePathLease(b.ID, "shared/file.go")
+	if okB {
+		t.Error("B acquired shared/file.go — should have been blocked by A's lease")
+	}
+	t.Logf("path conflict serialized: A=%d owns shared/file.go, B=%d blocked", a.ID, b.ID)
+
+	// After A releases, B can acquire.
+	s.ReleasePathLeases(a.ID)
+	okB2, _ := s.AcquirePathLease(b.ID, "shared/file.go")
+	if !okB2 {
+		t.Error("B could not acquire after A released")
+	}
+	t.Log("serialized: A released → B acquired")
+}
+
+// 8. 3 tasks multi-parent → join after BOTH done
+func TestMultiParentJoin(t *testing.T) {
+	s, _ := NewInMemory()
+	defer s.Close()
+
+	// Fan-in: B → D, C → D. D requires both B and C.
+	b, _ := s.CreateTask(1, "B", 0)
+	c, _ := s.CreateTask(1, "C", 0)
+	d, _ := s.CreateTask(1, "D", 0)
+	s.AddDependency(d.ID, b.ID)
+	s.AddDependency(d.ID, c.ID)
+
+	// Complete B only → D still blocked.
+	s.UpdateTaskStatus(b.ID, StatusCompleted)
+	s.UpdateTaskStatus(d.ID, StatusBlocked)
+	unblocked, _ := s.UnblockIfReady(d.ID)
+	if unblocked {
+		t.Error("D unblocked before C completed")
+	}
+
+	// Complete C → D unblocks (both parents done).
+	s.UpdateTaskStatus(c.ID, StatusCompleted)
+	unblocked2, _ := s.UnblockIfReady(d.ID)
+	if !unblocked2 {
+		t.Errorf("D not unblocked after both parents completed. D status check")
+	}
+	dFinal, _ := s.GetTask(d.ID)
+	t.Logf("fan-in: B + C → D. D final=%s (want pending)", dFinal.Status)
+	if dFinal.Status != StatusPending {
+		t.Errorf("D final = %s, want pending", dFinal.Status)
+	}
+}
+
+// 9. Tracker real command proof — CreateTaskFull stores command + validator
+func TestCreateTaskFullStoresAllFields(t *testing.T) {
+	s, _ := NewInMemory()
+	defer s.Close()
+
+	task, err := s.CreateTaskFull(1, "real-task", 0, "/repo/x", "claude -p 'fix bug'", "grep -q PASS", "src/bug.go,src/fix.go")
+	if err != nil {
+		t.Fatalf("CreateTaskFull: %v", err)
+	}
+	if task.Command != "claude -p 'fix bug'" {
+		t.Errorf("command = %s", task.Command)
+	}
+	if task.Validator != "grep -q PASS" {
+		t.Errorf("validator = %s", task.Validator)
+	}
+	if task.OwnedPaths != "src/bug.go,src/fix.go" {
+		t.Errorf("owned_paths = %s", task.OwnedPaths)
+	}
+	if task.Repo != "/repo/x" {
+		t.Errorf("repo = %s", task.Repo)
+	}
+	t.Logf("full task: cmd=%q val=%q paths=%q repo=%q", task.Command, task.Validator, task.OwnedPaths, task.Repo)
+}

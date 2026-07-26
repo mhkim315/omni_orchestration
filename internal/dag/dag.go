@@ -41,6 +41,8 @@ type Task struct {
 	Title           string    `json:"title"`
 	Status          string    `json:"status"`
 	Command         string    `json:"command,omitempty"`
+	Validator       string    `json:"validator,omitempty"`
+	OwnedPaths      string    `json:"owned_paths,omitempty"`
 	DependsOnTaskID int64     `json:"depends_on_task_id,omitempty"`
 	Repo            string    `json:"repo,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
@@ -167,7 +169,7 @@ func (s *Store) migrate() error {
 		return err
 	}
 	// v3.0: repo column for multi-repo fleet.
-	for _, col := range []string{"repo"} {
+	for _, col := range []string{"repo", "command", "validator", "owned_paths"} {
 		s.db.Exec("ALTER TABLE dag_tasks ADD COLUMN " + col + " TEXT NOT NULL DEFAULT ''")
 	}
 	return nil
@@ -191,8 +193,8 @@ func (s *Store) CreateTaskMultiDep(runID int64, title string, dependsOnIDs []int
 		status = StatusBlocked
 	}
 	res, err := s.db.Exec(
-		"INSERT INTO dag_tasks (run_id, title, status, depends_on_task_id, repo) VALUES (?,?,?,?,?)",
-		runID, title, status, 0, repo,
+		"INSERT INTO dag_tasks (run_id, title, status, depends_on_task_id, repo, command, validator, owned_paths) VALUES (?,?,?,?,?,?,?,?)",
+		runID, title, status, 0, repo, title, "", "",
 	)
 	if err != nil {
 		return nil, err
@@ -205,6 +207,11 @@ func (s *Store) CreateTaskMultiDep(runID int64, title string, dependsOnIDs []int
 }
 
 func (s *Store) CreateTaskWithRepo(runID int64, title string, dependsOn int64, repo string) (*Task, error) {
+	return s.CreateTaskFull(runID, title, dependsOn, repo, "", "", "")
+}
+
+// CreateTaskFull creates a task with all fields (command, validator, owned_paths).
+func (s *Store) CreateTaskFull(runID int64, title string, dependsOn int64, repo, command, validator, ownedPaths string) (*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -222,8 +229,8 @@ func (s *Store) CreateTaskWithRepo(runID int64, title string, dependsOn int64, r
 	}
 
 	res, err := s.db.Exec(
-		"INSERT INTO dag_tasks (run_id, title, status, depends_on_task_id, repo) VALUES (?,?,?,?,?)",
-		runID, title, status, dependsOn, repo,
+		"INSERT INTO dag_tasks (run_id, title, status, depends_on_task_id, repo, command, validator, owned_paths) VALUES (?,?,?,?,?,?,?,?)",
+		runID, title, status, dependsOn, repo, command, validator, ownedPaths,
 	)
 	if err == nil && dependsOn > 0 {
 		id, _ := res.LastInsertId()
@@ -248,9 +255,9 @@ func (s *Store) getTask(id int64) (*Task, error) {
 	var createdAt string
 	var dependsOn sql.NullInt64
 	err := s.db.QueryRow(
-		"SELECT id, run_id, title, status, depends_on_task_id, repo, created_at FROM dag_tasks WHERE id=?",
+		"SELECT id, run_id, title, status, depends_on_task_id, repo, command, validator, owned_paths, created_at FROM dag_tasks WHERE id=?",
 		id,
-	).Scan(&t.ID, &t.RunID, &t.Title, &t.Status, &dependsOn, &t.Repo, &createdAt)
+	).Scan(&t.ID, &t.RunID, &t.Title, &t.Status, &dependsOn, &t.Repo, &t.Command, &t.Validator, &t.OwnedPaths, &createdAt)
 	if err != nil {
 		return nil, err
 	}
@@ -358,21 +365,21 @@ func (s *Store) UpdateTaskStatus(id int64, status string) error {
 func (s *Store) GetBlockedTasks() ([]*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, repo, created_at FROM dag_tasks WHERE status=?", StatusBlocked)
+	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, repo, command, validator, owned_paths, created_at FROM dag_tasks WHERE status=?", StatusBlocked)
 }
 
 // GetReadyTasks returns pending tasks (ready to execute).
 func (s *Store) GetReadyTasks() ([]*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, repo, created_at FROM dag_tasks WHERE status=?", StatusPending)
+	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, repo, command, validator, owned_paths, created_at FROM dag_tasks WHERE status=?", StatusPending)
 }
 
 // GetTasksByRun returns all tasks for a run.
 func (s *Store) GetTasksByRun(runID int64) ([]*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, repo, created_at FROM dag_tasks WHERE run_id=? ORDER BY id", runID)
+	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, repo, command, validator, owned_paths, created_at FROM dag_tasks WHERE run_id=? ORDER BY id", runID)
 }
 
 // UnblockDependents finds all tasks blocked on the given task and unblocks them.
@@ -382,8 +389,8 @@ func (s *Store) GetTasksByRun(runID int64) ([]*Task, error) {
 func (s *Store) UnblockDependents(completedTaskID int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// v3.0.2: Unblock children via task_dependencies where this task is a parent.
-	// For multi-parent fan-in, call UnblockIfReady to check ALL parents.
+	// v3.0.4: Unblock children via task_dependencies where this task is a parent.
+	// For multi-parent fan-in, call UnblockIfReady separately.
 	res, err := s.db.Exec(
 		`UPDATE dag_tasks SET status=? WHERE id IN (
 			SELECT task_id FROM task_dependencies WHERE depends_on_task_id=?
@@ -456,7 +463,7 @@ func (s *Store) queryTasks(query string, args ...interface{}) ([]*Task, error) {
 		t := &Task{}
 		var createdAt string
 		var dependsOn sql.NullInt64
-		if err := rows.Scan(&t.ID, &t.RunID, &t.Title, &t.Status, &dependsOn, &t.Repo, &createdAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.RunID, &t.Title, &t.Status, &dependsOn, &t.Repo, &t.Command, &t.Validator, &t.OwnedPaths, &createdAt); err != nil {
 			return nil, err
 		}
 		if dependsOn.Valid {
