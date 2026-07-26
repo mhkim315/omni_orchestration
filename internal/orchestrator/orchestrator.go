@@ -272,14 +272,17 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		}
 		rc.decisions = append(rc.decisions, resp.Decision)
 
-		// R8 Fix 2: Atomic dedup — single INSERT OR IGNORE, check rowsAffected.
-		// No separate IsDuplicate/HasEffect pre-check (which would race).
+		// R9 Fix 3: Atomic dedup — single INSERT OR IGNORE, check rowsAffected.
+		// DB error → fail-closed: return error, don't apply decision.
 		effectKey := fmt.Sprintf("run-%d-att-%d-decision-%s", rc.runID, attemptNum, resp.Decision)
 		isNew, err := rc.gateway.RecordEffect(effectKey)
 		if err != nil {
-			log.Printf("R8: RecordEffect failed: %v", err)
-		} else if !isNew {
-			log.Printf("R8: duplicate effect key %q — skipping decision replay", effectKey)
+			log.Printf("R9: RecordEffect DB error: %v — failing closed", err)
+			rc.finalizeTerminal(ast, taskstore.StatusFailed)
+			return rc.decisions, fmt.Errorf("effect key persist failed: %w", err)
+		}
+		if !isNew {
+			log.Printf("R9: duplicate effect key %q — skipping decision replay", effectKey)
 			rc.finalizeTerminal(ast, taskstore.StatusCancelled)
 			return rc.decisions, nil
 		}
@@ -295,8 +298,16 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 					rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
 					return rc.decisions, fmt.Errorf("adoption failed: %w", err)
 				}
+			} else if rc.cfg.Provider != "" {
+				// R9 Fix 2: Adoption fail-closed — provider was set so run_record
+				// should exist. Missing run_record with known provider = failure.
+				log.Printf("R9: no run_record for run %d (provider=%s) — failing closed", rc.runID, rc.cfg.Provider)
+				rc.store.UpdateRunStatus(rc.runID, taskstore.StatusFailed)
+				rc.store.UpdateTaskStatus(rc.taskID, taskstore.StatusFailed)
+				rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
+				return rc.decisions, fmt.Errorf("adoption impossible: %w", err)
 			} else {
-				log.Printf("R2: no run_record for run %d — skipping adoption", rc.runID)
+				log.Printf("R2: no run_record for run %d — skipping adoption (no provider)", rc.runID)
 			}
 			rc.finalizeTerminal(ast, taskstore.StatusCompleted)
 			return rc.decisions, nil
