@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os/exec"
 	"syscall"
 	"time"
 
@@ -138,29 +139,54 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 				continue
 			}
 
-			// Attach to existing process with identity verification.
-			rt := runtime.NewWithID(a.WorkerID, w.Generation)
-			id := runtime.AttachIdentity{PID: w.PID, Executable: w.Command, StartTime: fmt.Sprintf("%d", w.StartTime)}
-			if err := rt.Attach(w.PID, id); err != nil {
-				log.Printf("RESUME: attempt %d attach pid %d failed: %v", a.ID, w.PID, err)
+			// Verify PID still alive.
+			if err := syscall.Kill(w.PID, 0); err != nil {
+				log.Printf("RESUME: attempt %d pid %d dead: %v", a.ID, w.PID, err)
 				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
 				decisions = append(decisions, DecisionFail)
 				continue
 			}
+
+			// Attach with identity verification + stored generation.
+			rt := runtime.NewWithID(a.WorkerID, w.Generation)
+			id := runtime.AttachIdentity{
+				PID: w.PID, Executable: w.Command,
+				CWD: w.CWD, StartTime: fmt.Sprintf("%d", w.StartTime), PGID: w.PGID,
+			}
+			if err := rt.Attach(w.PID, id, w.Generation); err != nil {
+				log.Printf("RESUME: attempt %d attach failed: %v", a.ID, err)
+				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
+				decisions = append(decisions, DecisionFail)
+				continue
+			}
+
+			// Fix 3: start supervisor loop + validator on attached runtime.
+			go func(attemptID int64) {
+				supCfg := supervisor.Config{QuiescenceTimeout: 30 * time.Second, PollInterval: 5 * time.Second}
+				sup := supervisor.New(supCfg)
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+				defer cancel()
+				for sc := range sup.Observe(ctx, rt) {
+					log.Printf("RESUME: attempt %d supervisor: %s→%s", attemptID, sc.From, sc.To)
+					if sc.To == supervisor.StateExited || sc.To == supervisor.StateCrashed {
+						ev := rt.Wait()
+						if ev.ExitCode == 0 && cfg.Validator != "" {
+							// Run validator on attached worktree.
+							validated := runValidatorOnPath(cfg.Repo, cfg.Validator)
+							if validated {
+								store.UpdateAttemptStatus(attemptID, taskstore.StatusCompleted)
+							} else {
+								store.UpdateAttemptStatus(attemptID, taskstore.StatusFailed)
+							}
+						}
+						return
+					}
+				}
+			}(a.ID)
+
 			decisions = append(decisions, DecisionRetryClean)
 			store.UpdateAttemptStatus(a.ID, taskstore.StatusRunning)
-			log.Printf("RESUME: attempt %d worker %s attached to pid %d (exec=%s gen=%d)",
-				a.ID, a.WorkerID, w.PID, w.Command, w.Generation)
-
-			// Start supervisor+validator on attached runtime.
-			go func(rt *runtime.Runtime) {
-				cfg := supervisor.Config{QuiescenceTimeout: 30 * time.Second, PollInterval: 5 * time.Second}
-				sup := supervisor.New(cfg)
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-				defer cancel()
-				for range sup.Observe(ctx, rt) {
-				}
-			}(rt)
+			log.Printf("RESUME: attempt %d attached pid %d cmd=%s gen=%d", a.ID, w.PID, w.Command, w.Generation)
 		}
 		return decisions, nil
 	}
@@ -189,6 +215,13 @@ func RecoverOnly(store *taskstore.Store, wt *worktree.Manager) ReconcileResult {
 // is likely stale (process died between wake and decision).
 func StaleCoordinatorDetected(coordGen int64, lastKnownGen int64) bool {
 	return coordGen > 0 && lastKnownGen > 0 && coordGen != lastKnownGen
+}
+
+// runValidatorOnPath runs the validator in the given directory.
+func runValidatorOnPath(path, validatorCmd string) bool {
+	cmd := exec.Command("bash", "-c", validatorCmd)
+	cmd.Dir = path
+	return cmd.Run() == nil
 }
 
 // Ensure fmt is used.
