@@ -361,11 +361,12 @@ func (r *Runtime) PID() int {
 
 // AttachIdentity holds verified process identity for recovery attach.
 type AttachIdentity struct {
-	PID        int
-	Executable string
-	CWD        string
-	StartTime  string // ps lstart format
-	PGID       int
+	PID          int
+	Executable   string
+	CWD          string
+	StartTimeMs  int64 // stored ms from WorkerRecord
+	StartTimeSec int64 // verified seconds from ps lstart
+	PGID         int
 }
 
 // Attach verifies the given PID is alive, validates its identity against
@@ -389,9 +390,12 @@ func (r *Runtime) Attach(pid int, id AttachIdentity, generation int64) error {
 	if id.Executable != "" && !commandMatches(id.Executable, verified.Executable) {
 		return fmt.Errorf("runtime: attach pid %d cmd mismatch: stored=%q actual=%q", pid, id.Executable, verified.Executable)
 	}
-	// Fix 2: compare StartTime (unix-seconds format from ps lstart).
-	if id.StartTime != "" && verified.StartTime != "" && id.StartTime != verified.StartTime {
-		return fmt.Errorf("runtime: attach pid %d start-time mismatch: stored=%q actual=%q", pid, id.StartTime, verified.StartTime)
+	// Fix 1: stored StartTime is ms, verified is seconds. Compare as integers.
+	if id.StartTimeMs > 0 && verified.StartTimeSec > 0 {
+		storedSec := id.StartTimeMs / 1000
+		if storedSec != verified.StartTimeSec {
+			return fmt.Errorf("runtime: attach pid %d start-time mismatch: stored=%d actual=%d", pid, storedSec, verified.StartTimeSec)
+		}
 	}
 	// Fix 2: compare CWD if available.
 	if id.CWD != "" && verified.CWD != "" && id.CWD != verified.CWD {
@@ -415,10 +419,14 @@ func (r *Runtime) Attach(pid int, id AttachIdentity, generation int64) error {
 }
 
 // commandMatches checks if the stored command matches the process comm.
-// Exact-path: filepath.Base(stored) must equal actual (after stripping leading "-").
+// Strips args from stored (e.g. "claude -p --output-format json" → "claude").
+// Compares base name against actual comm (stripping leading "-").
 // "/usr/local/bin/claude" matches "claude". "bash" matches "-bash".
-// Substring matches are rejected — only exact base-name match.
 func commandMatches(stored, actual string) bool {
+	// Strip args — only compare executable name.
+	if idx := strings.Index(stored, " "); idx > 0 {
+		stored = stored[:idx]
+	}
 	storedBase := filepath.Base(strings.TrimSpace(stored))
 	actual = strings.TrimPrefix(strings.TrimSpace(actual), "-")
 	return storedBase == actual
@@ -447,7 +455,7 @@ func verifyAttachIdentity(pid int) (AttachIdentity, error) {
 	if len(fields) >= 6 {
 		executable = fields[5]
 	}
-	return AttachIdentity{PID: pid, Executable: executable, StartTime: fmt.Sprintf("%d", startSec)}, nil
+	return AttachIdentity{PID: pid, Executable: executable, StartTimeSec: startSec}, nil
 }
 
 // watchAttached polls kill(pid,0) until the process exits.

@@ -145,7 +145,7 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 			rt := runtime.NewWithID(a.WorkerID, w.Generation)
 			id := runtime.AttachIdentity{
 				PID: w.PID, Executable: w.Command,
-				CWD: w.CWD, StartTime: fmt.Sprintf("%d", w.StartTime), PGID: w.PGID,
+				CWD: w.CWD, StartTimeMs: w.StartTime, PGID: w.PGID,
 			}
 			if err := rt.Attach(w.PID, id, w.Generation); err != nil {
 				log.Printf("RESUME: attempt %d attach failed: %v", a.ID, err)
@@ -154,9 +154,9 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 				continue
 			}
 
-			// Fix 3: start supervisor loop + validator on attached runtime.
+			// Fix 2+3: start supervisor loop + validator on attached runtime.
 			wg.Add(1)
-			go func(attemptID int64) {
+			go func(attemptID int64, workerCWD string) {
 				defer wg.Done()
 				supCfg := supervisor.Config{QuiescenceTimeout: 30 * time.Second, PollInterval: 5 * time.Second}
 				sup := supervisor.New(supCfg)
@@ -166,19 +166,27 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 					log.Printf("RESUME: attempt %d supervisor: %s→%s", attemptID, sc.From, sc.To)
 					if sc.To == supervisor.StateExited || sc.To == supervisor.StateCrashed {
 						ev := rt.Wait()
-						if ev.ExitCode == 0 && cfg.Validator != "" {
-							// Run validator on attached worktree.
-							validated := runValidatorOnPath(cfg.Repo, cfg.Validator)
-							if validated {
-								store.UpdateAttemptStatus(attemptID, taskstore.StatusCompleted)
+						status := taskstore.StatusFailed
+						// Fix 3: CRASHED (exitCode=-1) → skip validator, mark failed.
+						if sc.To == supervisor.StateExited && ev.ExitCode == 0 {
+							if cfg.Validator != "" {
+								// Fix 2: validator runs in stored worker CWD.
+								if runValidatorOnPath(workerCWD, cfg.Validator) {
+									status = taskstore.StatusCompleted
+								}
 							} else {
-								store.UpdateAttemptStatus(attemptID, taskstore.StatusFailed)
+								status = taskstore.StatusCompleted
 							}
 						}
+						// Fix 2: finalizeTerminal on ALL paths.
+						store.UpdateWorkerStatus(w.ID, status)
+						store.UpdateAttemptStatus(attemptID, status)
+						store.UpdateRunStatus(0, status)  // runID from attempt not available in recovery
+						store.UpdateTaskStatus(0, status) // taskID from attempt not available in recovery
 						return
 					}
 				}
-			}(a.ID)
+			}(a.ID, w.CWD)
 
 			decisions = append(decisions, DecisionRetryClean)
 			store.UpdateAttemptStatus(a.ID, taskstore.StatusRunning)
