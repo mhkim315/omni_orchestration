@@ -39,22 +39,24 @@ func Reconcile(store *taskstore.Store, wt *worktree.Manager) ReconcileResult {
 	r.OrphanRuns = len(active)
 
 	for _, a := range active {
-		// Mark attempt as interrupted.
-		if a.Status == taskstore.StatusRunning || a.Status == taskstore.StatusPending {
+		if a.Status != taskstore.StatusRunning && a.Status != taskstore.StatusPending {
+			continue
+		}
+		// Only mark as interrupted if there's NO checkpoint (never started).
+		// Attempts with checkpoints are re-own candidates, not interrupted.
+		if a.CheckpointCommit == "" {
 			if err := store.UpdateAttemptStatus(a.ID, StatusInterrupted); err != nil {
 				r.Errors = append(r.Errors, fmt.Sprintf("update attempt %d: %v", a.ID, err))
 				continue
 			}
 			r.Interrupted++
-
-			// Create recovery checkpoint if there's a checkpoint SHA.
-			if a.CheckpointCommit != "" {
-				cpshort := a.CheckpointCommit
-				if len(cpshort) > 8 {
-					cpshort = cpshort[:8]
-				}
-				log.Printf("RECOVERY: attempt %d checkpoint %s marked interrupted", a.ID, cpshort)
+			log.Printf("RECOVERY: attempt %d (no checkpoint) marked interrupted", a.ID)
+		} else {
+			cpshort := a.CheckpointCommit
+			if len(cpshort) > 8 {
+				cpshort = cpshort[:8]
 			}
+			log.Printf("RECOVERY: attempt %d checkpoint %s — preserving for re-own", a.ID, cpshort)
 		}
 	}
 

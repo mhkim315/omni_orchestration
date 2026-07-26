@@ -181,6 +181,7 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 	}
 	rc.decisions = append(rc.decisions, startResp.Decision)
 	if startResp.Decision == DecisionFail {
+		store.UpdateRunStatus(run.ID, taskstore.StatusFailed)
 		store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
 		return rc.decisions, nil
 	}
@@ -204,6 +205,7 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		if startResp.Decision == DecisionValidate && rc.cfg.Coordinator == nil {
 			autoValidateCount++
 			if autoValidateCount > maxAutoValidate {
+				store.UpdateRunStatus(run.ID, taskstore.StatusFailed)
 				store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
 				log.Printf("C2: max auto-VALIDATE (%d) exceeded", maxAutoValidate)
 				return rc.decisions, nil
@@ -213,6 +215,7 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		}
 
 		if attemptNum > maxAtts {
+			store.UpdateRunStatus(run.ID, taskstore.StatusFailed)
 			store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
 			log.Printf("B-R1: max attempts (%d) exceeded → FAIL", maxAtts)
 			return rc.decisions, nil
