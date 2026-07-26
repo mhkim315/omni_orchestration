@@ -385,16 +385,18 @@ func (r *Runtime) Attach(pid int, id AttachIdentity, generation int64) error {
 		return fmt.Errorf("runtime: attach verify pid %d: %w", pid, err)
 	}
 
-	// Fix 1: match command prefix (ps shows "claude", stored is "/usr/local/bin/claude").
+	// Fix 1: commandMatches exact-path or full-command, not substring.
 	if id.Executable != "" && !commandMatches(id.Executable, verified.Executable) {
 		return fmt.Errorf("runtime: attach pid %d cmd mismatch: stored=%q actual=%q", pid, id.Executable, verified.Executable)
 	}
-	// Fix 2: compare StartTime for identity stability.
+	// Fix 2: compare StartTime (unix-seconds format from ps lstart).
 	if id.StartTime != "" && verified.StartTime != "" && id.StartTime != verified.StartTime {
 		return fmt.Errorf("runtime: attach pid %d start-time mismatch: stored=%q actual=%q", pid, id.StartTime, verified.StartTime)
 	}
-	_ = id.CWD
-	_ = id.PGID
+	// Fix 2: compare CWD if available.
+	if id.CWD != "" && verified.CWD != "" && id.CWD != verified.CWD {
+		return fmt.Errorf("runtime: attach pid %d cwd mismatch: stored=%q actual=%q", pid, id.CWD, verified.CWD)
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -413,15 +415,18 @@ func (r *Runtime) Attach(pid int, id AttachIdentity, generation int64) error {
 }
 
 // commandMatches checks if the stored command matches the process comm.
-// "claude" matches "/usr/local/bin/claude", "bash" matches "-bash".
+// Exact-path: filepath.Base(stored) must equal actual (after stripping leading "-").
+// "/usr/local/bin/claude" matches "claude". "bash" matches "-bash".
+// Substring matches are rejected — only exact base-name match.
 func commandMatches(stored, actual string) bool {
-	stored = filepath.Base(strings.TrimSpace(stored))
+	storedBase := filepath.Base(strings.TrimSpace(stored))
 	actual = strings.TrimPrefix(strings.TrimSpace(actual), "-")
-	return stored == actual || strings.Contains(stored, actual) || strings.Contains(actual, stored)
+	return storedBase == actual
 }
 
-// verifyAttachIdentity identifies a process via ps.
+// verifyAttachIdentity identifies a process via ps with unix-format start time.
 func verifyAttachIdentity(pid int) (AttachIdentity, error) {
+	// Fix 1: lstart unix format for start-time comparison (seconds since epoch).
 	cmd := exec.Command("ps", "-p", fmt.Sprintf("%d", pid), "-o", "lstart=,comm=")
 	out, err := cmd.Output()
 	if err != nil {
@@ -431,15 +436,23 @@ func verifyAttachIdentity(pid int) (AttachIdentity, error) {
 	if len(fields) < 6 {
 		return AttachIdentity{}, fmt.Errorf("ps: unexpected output: %q", string(out))
 	}
-	startTime := strings.Join(fields[:5], " ")
+	// lstart format: "Mon Jul 28 01:23:45 2026" — convert to unix ms.
+	startStr := strings.Join(fields[:5], " ")
+	t, err := time.Parse("Mon Jan 2 15:04:05 2006", startStr)
+	var startMs int64
+	if err == nil {
+		startMs = t.UnixMilli()
+	}
 	executable := ""
 	if len(fields) >= 6 {
 		executable = fields[5]
 	}
-	return AttachIdentity{PID: pid, Executable: executable, StartTime: startTime}, nil
+	return AttachIdentity{PID: pid, Executable: executable, StartTime: fmt.Sprintf("%d", startMs)}, nil
 }
 
-// watchAttached polls kill(pid, 0) until the process exits.
+// watchAttached polls kill(pid,0) until the process exits.
+// Uses wait4 with WNOHANG to attempt exit code capture for child processes.
+// For non-child attached processes, exit code is -1 (unknown).
 func (r *Runtime) watchAttached(pid int) {
 	defer r.outputWg.Done()
 	defer close(r.output)
@@ -450,14 +463,35 @@ func (r *Runtime) watchAttached(pid int) {
 		case <-r.ctx.Done():
 			return
 		case <-ticker.C:
-			if err := syscall.Kill(pid, 0); err != nil {
-				ev := ExitEvent{ExitedAt: time.Now(), ExitCode: -1}
-				r.doneOnce.Do(func() { r.exitVal = ev; close(r.done) })
-				r.mu.Lock()
-				r.closed = true
-				r.mu.Unlock()
-				return
+			// Try wait4 for exit code (works only for child processes).
+			var wstatus syscall.WaitStatus
+			wpid, err := syscall.Wait4(pid, &wstatus, syscall.WNOHANG, nil)
+			if err != nil || wpid != pid {
+				// Not our child — fall back to kill(pid,0) liveness check.
+				if err2 := syscall.Kill(pid, 0); err2 != nil {
+					ev := ExitEvent{ExitedAt: time.Now(), ExitCode: -1}
+					r.doneOnce.Do(func() { r.exitVal = ev; close(r.done) })
+					r.mu.Lock()
+					r.closed = true
+					r.mu.Unlock()
+					return
+				}
+				continue
 			}
+			// Child exited — capture real exit code.
+			ev := ExitEvent{ExitedAt: time.Now()}
+			if wstatus.Exited() {
+				ev.ExitCode = wstatus.ExitStatus()
+			} else if wstatus.Signaled() {
+				ev.Signaled = true
+				ev.Signal = wstatus.Signal()
+				ev.ExitCode = -1
+			}
+			r.doneOnce.Do(func() { r.exitVal = ev; close(r.done) })
+			r.mu.Lock()
+			r.closed = true
+			r.mu.Unlock()
+			return
 		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"sync"
 	"syscall"
 	"time"
 
@@ -119,6 +120,7 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 	if len(active) > 0 {
 		log.Printf("RESUME: %d active attempts after reconcile — re-owning", len(active))
 		var decisions []Decision
+		var wg sync.WaitGroup
 		for _, a := range active {
 			// Look up worker by attempt ID (worker primary key, not attempt ID).
 			w, err := store.GetWorkerByAttempt(a.ID)
@@ -139,14 +141,6 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 				continue
 			}
 
-			// Verify PID still alive.
-			if err := syscall.Kill(w.PID, 0); err != nil {
-				log.Printf("RESUME: attempt %d pid %d dead: %v", a.ID, w.PID, err)
-				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
-				decisions = append(decisions, DecisionFail)
-				continue
-			}
-
 			// Attach with identity verification + stored generation.
 			rt := runtime.NewWithID(a.WorkerID, w.Generation)
 			id := runtime.AttachIdentity{
@@ -161,7 +155,9 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 			}
 
 			// Fix 3: start supervisor loop + validator on attached runtime.
+			wg.Add(1)
 			go func(attemptID int64) {
+				defer wg.Done()
 				supCfg := supervisor.Config{QuiescenceTimeout: 30 * time.Second, PollInterval: 5 * time.Second}
 				sup := supervisor.New(supCfg)
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
@@ -188,6 +184,7 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 			store.UpdateAttemptStatus(a.ID, taskstore.StatusRunning)
 			log.Printf("RESUME: attempt %d attached pid %d cmd=%s gen=%d", a.ID, w.PID, w.Command, w.Generation)
 		}
+		wg.Wait() // Fix 5: Resume blocks until recovery completes.
 		return decisions, nil
 	}
 
