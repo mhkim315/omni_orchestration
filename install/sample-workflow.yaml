@@ -1,0 +1,37 @@
+# Sample OMNI Fleet workflow plan
+# Run: omni fleet run --plan sample-workflow.yaml --repo . --max-workers 2
+
+tasks:
+  - id: setup
+    title: "Initialize project dependencies"
+    command: "go mod download && go build ./..."
+    validator: "test -f go.mod"
+    owned_paths: ["go.mod", "go.sum"]
+
+  - id: test-core
+    title: "Run core unit tests"
+    command: "go test ./internal/taskstore ./internal/mailbox -count=1"
+    validator: "grep -q '^ok' /dev/stdin"
+    depends_on: [setup]
+    owned_paths: ["internal/taskstore/", "internal/mailbox/"]
+
+  - id: test-orchestrator
+    title: "Run orchestrator integration tests"
+    command: "go test ./internal/orchestrator -count=1 -timeout 60s"
+    validator: "grep -q '^ok' /dev/stdin"
+    depends_on: [setup]
+    owned_paths: ["internal/orchestrator/"]
+
+  - id: lint
+    title: "Run linter and vet"
+    command: "go vet ./... && gofmt -l ."
+    validator: "test $? -eq 0"
+    depends_on: [setup]
+    owned_paths: ["*.go"]
+
+  - id: build
+    title: "Build binaries"
+    command: "go build -o omni ./cmd/omni && go build -o omnid ./cmd/omnid"
+    validator: "test -f omni && test -f omnid"
+    depends_on: [test-core, test-orchestrator, lint]
+    owned_paths: ["omni", "omnid"]

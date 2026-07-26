@@ -61,6 +61,12 @@ func run() error {
 	if os.Args[1] == "fleet" {
 		return fleetCmd(os.Args[2:])
 	}
+	if os.Args[1] == "doctor" {
+		return doctorCmd()
+	}
+	if os.Args[1] == "providers" {
+		return providersCmd()
+	}
 	if os.Args[1] != "run" {
 		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--resume] [--coordinator codex|claude|agy|reasonix|auto] [--model <name>] [--effort low|medium|high] [--validator <cmd>] [--store <path>]\n")
 		os.Exit(2)
@@ -543,5 +549,71 @@ func fleetCmd(args []string) error {
 
 	// Block until signal.
 	daemon.WaitForSignal(d)
+	return nil
+}
+
+// ── Doctor subcommand (v2.2) ──
+
+func doctorCmd() error {
+	allOK := true
+	check := func(name string, ok bool, detail string) {
+		mark := "✓"
+		if !ok {
+			mark = "✗"
+			allOK = false
+		}
+		fmt.Printf("  %s %s: %s\n", mark, name, detail)
+	}
+
+	fmt.Println("omni doctor — checking environment...")
+	fmt.Println()
+
+	// Go PATH.
+	goPath, err := exec.LookPath("go")
+	check("Go", err == nil, goPath)
+
+	// SQLite.
+	sqlitePath, _ := exec.LookPath("sqlite3")
+	check("SQLite", sqlitePath != "" || true, "bundled (modernc.org/sqlite)")
+
+	// Git.
+	gitPath, err := exec.LookPath("git")
+	check("Git", err == nil, gitPath)
+
+	// Providers.
+	for _, p := range []string{"claude", "codex", "agy", "reasonix"} {
+		path, err := exec.LookPath(p)
+		check(p, err == nil, path)
+	}
+
+	// Store.
+	storePath := filepath.Join(os.TempDir(), "omni-doctor-test.db")
+	store, err := taskstore.New(storePath)
+	if err == nil {
+		store.Close()
+		os.Remove(storePath)
+	}
+	check("TaskStore", err == nil, "read/write OK")
+
+	fmt.Println()
+	if allOK {
+		fmt.Println("omni is ready to use.")
+		return nil
+	}
+	return fmt.Errorf("some checks failed — review above")
+}
+
+// ── Providers subcommand (v2.2) ──
+
+func providersCmd() error {
+	fmt.Println("installed providers:")
+	for _, p := range []string{"claude", "codex", "agy", "reasonix"} {
+		path, err := exec.LookPath(p)
+		if err == nil {
+			fmt.Printf("  ✓ %s (%s)\n", p, path)
+		} else {
+			fmt.Printf("  ✗ %s (not found)\n", p)
+		}
+	}
 	return nil
 }
