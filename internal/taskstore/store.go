@@ -66,6 +66,9 @@ type WorkerRecord struct {
 	Role       string `json:"role"`
 	Generation int64  `json:"generation"`
 	Status     string `json:"status"`
+	PID        int    `json:"pid"`
+	PGID       int    `json:"pgid"`
+	StartTime  int64  `json:"start_time"`
 }
 
 // Event is an emitted event tied to an orchestrator entity.

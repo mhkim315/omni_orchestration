@@ -123,6 +123,7 @@ type runContext struct {
 	taskID    int64
 	maxAtts   int
 	decisions []Decision
+	attempts  []*attemptState // all attempts for terminal cleanup
 }
 
 // Run executes the full orchestrator flow with coordinator-driven decisions.
@@ -329,10 +330,12 @@ func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instructi
 		rt.Write(rt.Generation(), []byte(instruction+"\n"))
 	}
 
-	return &attemptState{
+	ast := &attemptState{
 		info: info, rt: rt, attempt: attempt, worker: worker,
 		instruction: instruction,
-	}, nil
+	}
+	rc.attempts = append(rc.attempts, ast)
+	return ast, nil
 }
 
 func (rc *runContext) observeAndWait(ast *attemptState) observeResult {
@@ -452,9 +455,21 @@ func (rc *runContext) allowedDecisions(result observeResult) []string {
 }
 
 // finalizeTerminal updates ALL status fields for a terminal run outcome.
-// Call this at every terminal return path (FAIL, COMPLETE, max-attempts,
-// max-auto-validate, ctx cancel, createAttempt error).
+// Closes every tracked attempt worker, not just the current one.
 func (rc *runContext) finalizeTerminal(ast *attemptState, status string) {
+	// Close ALL prior attempt workers.
+	for _, a := range rc.attempts {
+		if a.rt != nil {
+			a.rt.Close(context.Background(), a.rt.Generation())
+		}
+		if a.attempt != nil {
+			rc.store.UpdateAttemptStatus(a.attempt.ID, status)
+		}
+		if a.worker != nil {
+			rc.store.UpdateWorkerStatus(a.worker.ID, status)
+		}
+	}
+	// Close current attempt if not already in the list.
 	if ast != nil {
 		if ast.rt != nil {
 			ast.rt.Close(context.Background(), ast.rt.Generation())
