@@ -190,6 +190,10 @@ func (s *Store) CreateTask(runID int64, title string, dependsOn int64) (*Task, e
 		"INSERT INTO dag_tasks (run_id, title, status, depends_on_task_id) VALUES (?,?,?,?)",
 		runID, title, status, dependsOn,
 	)
+	if err == nil && dependsOn > 0 {
+		id, _ := res.LastInsertId()
+		s.db.Exec("INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id) VALUES (?,?)", id, dependsOn)
+	}
 	if err != nil {
 		return nil, err
 	}
