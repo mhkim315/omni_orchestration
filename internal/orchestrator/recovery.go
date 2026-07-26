@@ -122,6 +122,12 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 		var decisions []Decision
 		var wg sync.WaitGroup
 		for _, a := range active {
+			// Fix 1: resolve actual runID+taskID from attempt.
+			var runID, taskID int64
+			taskID = a.TaskID
+			if t, err := store.GetTask(taskID); err == nil {
+				runID = t.RunID
+			}
 			// Look up worker by attempt ID (worker primary key, not attempt ID).
 			w, err := store.GetWorkerByAttempt(a.ID)
 			if err != nil {
@@ -156,7 +162,7 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 
 			// Fix 2+3: start supervisor loop + validator on attached runtime.
 			wg.Add(1)
-			go func(attemptID int64, workerCWD string) {
+			go func(attemptID int64, workerCWD string, rID, tID int64) {
 				defer wg.Done()
 				supCfg := supervisor.Config{QuiescenceTimeout: 30 * time.Second, PollInterval: 5 * time.Second}
 				sup := supervisor.New(supCfg)
@@ -168,7 +174,7 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 						ev := rt.Wait()
 						status := taskstore.StatusFailed
 						// Fix 3: CRASHED (exitCode=-1) → skip validator, mark failed.
-						if sc.To == supervisor.StateExited && ev.ExitCode == 0 {
+						if sc.To == supervisor.StateExited && ev.ExitCode >= 0 {
 							if cfg.Validator != "" {
 								// Fix 2: validator runs in stored worker CWD.
 								if runValidatorOnPath(workerCWD, cfg.Validator) {
@@ -181,12 +187,12 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 						// Fix 2: finalizeTerminal on ALL paths.
 						store.UpdateWorkerStatus(w.ID, status)
 						store.UpdateAttemptStatus(attemptID, status)
-						store.UpdateRunStatus(0, status)  // runID from attempt not available in recovery
-						store.UpdateTaskStatus(0, status) // taskID from attempt not available in recovery
+						store.UpdateRunStatus(rID, status)
+						store.UpdateTaskStatus(tID, status)
 						return
 					}
 				}
-			}(a.ID, w.CWD)
+			}(a.ID, w.CWD, runID, taskID)
 
 			decisions = append(decisions, DecisionRetryClean)
 			store.UpdateAttemptStatus(a.ID, taskstore.StatusRunning)
