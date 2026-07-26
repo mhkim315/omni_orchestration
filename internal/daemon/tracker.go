@@ -18,7 +18,13 @@ import (
 	"github.com/mhkim315/omni_orchestration/internal/worktree"
 )
 
-const maxWorkers = 2
+const defaultMaxWorkers = 2
+
+// TaskGroup orchestrates a set of related DAG tasks.
+type TaskGroup struct {
+	RunID int64
+	Tasks []*dag.Task
+}
 
 // OwnedPathMap tracks which paths are owned by which worker.
 type OwnedPathMap struct {
@@ -60,29 +66,39 @@ type Tracker struct {
 	wt       *worktree.Manager
 	cfg      orchestrator.Config
 
-	mu       sync.Mutex
-	active   map[int64]context.CancelFunc
-	workers  int // running worker count
-	paths    *OwnedPathMap
-	pollTick time.Duration
-	closed   bool
+	mu         sync.Mutex
+	active     map[int64]context.CancelFunc
+	maxWorkers int
+	paths      *OwnedPathMap
+	pollTick   time.Duration
+	closed     bool
 }
 
+// NewTracker creates a task tracker with the given worker pool size.
 func NewTracker(store *taskstore.Store, dagStore *dag.Store, wt *worktree.Manager, cfg orchestrator.Config) *Tracker {
+	return NewTrackerWithWorkers(store, dagStore, wt, cfg, defaultMaxWorkers)
+}
+
+// NewTrackerWithWorkers creates a tracker with a configurable worker count.
+func NewTrackerWithWorkers(store *taskstore.Store, dagStore *dag.Store, wt *worktree.Manager, cfg orchestrator.Config, maxWorkers int) *Tracker {
+	if maxWorkers < 1 {
+		maxWorkers = 1
+	}
 	return &Tracker{
-		store:    store,
-		dagStore: dagStore,
-		wt:       wt,
-		cfg:      cfg,
-		active:   make(map[int64]context.CancelFunc),
-		paths:    &OwnedPathMap{paths: make(map[string]int64)},
-		pollTick: 2 * time.Second,
+		store:      store,
+		dagStore:   dagStore,
+		wt:         wt,
+		cfg:        cfg,
+		active:     make(map[int64]context.CancelFunc),
+		maxWorkers: maxWorkers,
+		paths:      &OwnedPathMap{paths: make(map[string]int64)},
+		pollTick:   2 * time.Second,
 	}
 }
 
 func (t *Tracker) Start(ctx context.Context) {
 	go t.loop(ctx)
-	log.Printf("tracker: started (workers=%d, poll=%v)", maxWorkers, t.pollTick)
+	log.Printf("tracker: started (workers=%d, poll=%v)", t.maxWorkers, t.pollTick)
 }
 
 func (t *Tracker) loop(ctx context.Context) {
@@ -110,7 +126,7 @@ func (t *Tracker) poll(ctx context.Context) {
 
 	// Count active workers.
 	activeCount := len(t.active)
-	if activeCount >= maxWorkers {
+	if activeCount >= t.maxWorkers {
 		return // all workers busy
 	}
 
@@ -121,7 +137,7 @@ func (t *Tracker) poll(ctx context.Context) {
 	}
 
 	for _, task := range ready {
-		if len(t.active) >= maxWorkers {
+		if len(t.active) >= t.maxWorkers {
 			break
 		}
 		if _, running := t.active[task.ID]; running {

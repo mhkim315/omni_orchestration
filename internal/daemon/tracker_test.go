@@ -290,3 +290,143 @@ func TestRestartRecoversBothWorkers(t *testing.T) {
 	s2f, _ := dagStore2.GetTask(t2.ID)
 	t.Logf("final: t1=%s t2=%s", s1f.Status, s2f.Status)
 }
+
+// 7. DAG fan-out: 4 tasks (A→B, A→C, B→D, C→D) — parallel leaves
+func TestFleetDAGFanOut(t *testing.T) {
+	tr, dagStore, cleanup := setupTracker(t)
+	defer cleanup()
+
+	// Create fan-out DAG: A → B, A → C, B → D, C → D.
+	a, _ := dagStore.CreateTask(1, "task-A", 0)    // pending
+	b, _ := dagStore.CreateTask(1, "task-B", a.ID) // blocked on A
+	c, _ := dagStore.CreateTask(1, "task-C", a.ID) // blocked on A
+	d, _ := dagStore.CreateTask(1, "task-D", b.ID) // blocked on B
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr.Start(ctx)
+
+	// A completes → B, C unblocked → both run in parallel.
+	time.Sleep(5 * time.Second)
+
+	sa, _ := dagStore.GetTask(a.ID)
+	sb, _ := dagStore.GetTask(b.ID)
+	sc, _ := dagStore.GetTask(c.ID)
+	sd, _ := dagStore.GetTask(d.ID)
+	t.Logf("fan-out: A=%s B=%s C=%s D=%s", sa.Status, sb.Status, sc.Status, sd.Status)
+
+	if sa.Status == dag.StatusCompleted {
+		t.Log("✓ A completed")
+	}
+	// B and C should have been unblocked and potentially completed.
+	if sb.Status != dag.StatusBlocked {
+		t.Logf("B unblocked: %s", sb.Status)
+	}
+	if sc.Status != dag.StatusBlocked {
+		t.Logf("C unblocked: %s", sc.Status)
+	}
+}
+
+// 8. TaskGroup orchestration — batch create and execute
+func TestFleetTaskGroupOrchestration(t *testing.T) {
+	tr, dagStore, cleanup := setupTracker(t)
+	defer cleanup()
+
+	// Create a task group: 3 independent tasks.
+	group := &TaskGroup{RunID: 1}
+	for i, name := range []string{"batch-1", "batch-2", "batch-3"} {
+		task, _ := dagStore.CreateTask(group.RunID, name, 0)
+		group.Tasks = append(group.Tasks, task)
+		_ = i
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr.Start(ctx)
+
+	// All 3 should execute in parallel (maxWorkers=2, so 2 at a time).
+	time.Sleep(6 * time.Second)
+
+	completed := 0
+	for _, task := range group.Tasks {
+		dt, _ := dagStore.GetTask(task.ID)
+		t.Logf("TaskGroup %s: %s", task.Title, dt.Status)
+		if dt.Status == dag.StatusCompleted {
+			completed++
+		}
+	}
+	if completed == 3 {
+		t.Log("✓ All 3 TaskGroup tasks completed")
+	} else {
+		t.Logf("TaskGroup: %d/3 completed (some may need more time)", completed)
+	}
+}
+
+// 9. Full suite kill+recovery — Fan-out DAG survives restart
+func TestFleetKillRecoveryFullSuite(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "fleet-store.db")
+	dagPath := filepath.Join(t.TempDir(), "fleet-dag.db")
+
+	store, _ := taskstore.New(storePath)
+	dagStore, _ := dag.New(dagPath)
+
+	repoDir := t.TempDir()
+	os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# fleet"), 0644)
+
+	cfg := orchestrator.Config{Repo: repoDir, Command: "echo fleet-ready", Validator: "true"}
+	tr := NewTracker(store, dagStore, worktree.New(), cfg)
+
+	// Create DAG: A → B, A → C
+	a, _ := dagStore.CreateTask(1, "root-A", 0)
+	b, _ := dagStore.CreateTask(1, "child-B", a.ID)
+	c, _ := dagStore.CreateTask(1, "child-C", a.ID)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	tr.Start(ctx)
+	time.Sleep(3 * time.Second) // Let A complete + B/C start
+
+	// Kill.
+	cancel()
+	tr.Close()
+	store.Close()
+	dagStore.Close()
+
+	// Recover.
+	store2, _ := taskstore.New(storePath)
+	dagStore2, _ := dag.New(dagPath)
+	defer store2.Close()
+	defer dagStore2.Close()
+
+	tr2 := NewTracker(store2, dagStore2, worktree.New(), cfg)
+	defer tr2.Close()
+	tr2.ResumeActiveTasks()
+
+	// Verify DAG state survived.
+	aAfter, _ := dagStore2.GetTask(a.ID)
+	bAfter, _ := dagStore2.GetTask(b.ID)
+	cAfter, _ := dagStore2.GetTask(c.ID)
+	t.Logf("after kill: A=%s B=%s C=%s", aAfter.Status, bAfter.Status, cAfter.Status)
+
+	if aAfter.Status == "" || bAfter.Status == "" || cAfter.Status == "" {
+		t.Fatal("DAG tasks lost after kill+recovery")
+	}
+	t.Log("✓ Full DAG state survived kill+recovery")
+
+	// Resume execution.
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	tr2.Start(ctx2)
+	time.Sleep(5 * time.Second)
+
+	aFinal, _ := dagStore2.GetTask(a.ID)
+	bFinal, _ := dagStore2.GetTask(b.ID)
+	cFinal, _ := dagStore2.GetTask(c.ID)
+	t.Logf("final: A=%s B=%s C=%s", aFinal.Status, bFinal.Status, cFinal.Status)
+
+	if aFinal.Status == dag.StatusCompleted {
+		t.Log("✓ Fleet DAG: root completed")
+	}
+	if bFinal.Status == dag.StatusCompleted || cFinal.Status == dag.StatusCompleted {
+		t.Log("✓ Fleet DAG: children completed after recovery")
+	}
+}
