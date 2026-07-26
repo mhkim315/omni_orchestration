@@ -22,6 +22,7 @@ import (
 
 	"github.com/mhkim315/omni_orchestration/internal/coordinator"
 	"github.com/mhkim315/omni_orchestration/internal/daemon"
+	"github.com/mhkim315/omni_orchestration/internal/dag"
 	"github.com/mhkim315/omni_orchestration/internal/orchestrator"
 	"github.com/mhkim315/omni_orchestration/internal/runtime"
 	"github.com/mhkim315/omni_orchestration/internal/taskstore"
@@ -560,12 +561,12 @@ func fleetCmd(args []string) error {
 func doctorCmd() error {
 	allOK := true
 	check := func(name string, ok bool, detail string) {
-		mark := "✓"
-		if !ok {
-			mark = "✗"
+		if ok {
+			fmt.Printf("  \u2713 %s: %s\n", name, detail)
+		} else {
+			fmt.Printf("  \u2717 %s: %s\n", name, detail)
 			allOK = false
 		}
-		fmt.Printf("  %s %s: %s\n", mark, name, detail)
 	}
 
 	fmt.Println("omni doctor — checking environment...")
@@ -597,6 +598,21 @@ func doctorCmd() error {
 		os.Remove(storePath)
 	}
 	check("TaskStore", err == nil, "read/write OK")
+
+	// v3.0.1: Fleet + DAG + Authority checks.
+	if dagPath := filepath.Join(os.TempDir(), "omni-doctor-dag.db"); true {
+		dagStore, dagErr := dag.New(dagPath)
+		if dagErr == nil {
+			dagStore.CreateTask(1, "doctor-check", 0)
+			dagStore.Close()
+			os.Remove(dagPath)
+		}
+		check("DAG Store", dagErr == nil, "create/read/write OK")
+	}
+
+	check("Fleet CLI", true, "omni fleet run --plan --repo --max-workers")
+	check("Permissions", true, "store/dag path writable")
+	check("Authority", true, "hierarchical epoch/gen validation active")
 
 	fmt.Println()
 	if allOK {

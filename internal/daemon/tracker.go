@@ -144,10 +144,18 @@ func (t *Tracker) poll(ctx context.Context) {
 			continue
 		}
 
-		// v1.8: Path conflict check — serialize conflicting tasks.
+		// v3.0.1: Persistent path leases via DAG store (not in-memory).
 		taskPaths := taskOwnedPaths(task)
-		if !t.paths.TryAcquire(task.ID, taskPaths) {
-			log.Printf("tracker: task %d path conflict — waiting", task.ID)
+		acquiredAll := true
+		for _, p := range taskPaths {
+			ok, err := t.dagStore.AcquirePathLease(task.ID, p)
+			if err != nil || !ok {
+				log.Printf("tracker: task %d path %s conflict — waiting", task.ID, p)
+				acquiredAll = false
+				break
+			}
+		}
+		if !acquiredAll {
 			continue
 		}
 

@@ -354,11 +354,15 @@ func (s *Store) GetTasksByRun(runID int64) ([]*Task, error) {
 
 // UnblockDependents finds all tasks blocked on the given task and unblocks them.
 // Called when a task's VALIDATION_ACCEPTED message is received.
+// UnblockDependents finds all tasks blocked on the given task and unblocks them.
+// v3.0.1: Uses task_dependencies table (multi-parent), not legacy depends_on_task_id.
 func (s *Store) UnblockDependents(completedTaskID int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	res, err := s.db.Exec(
-		"UPDATE dag_tasks SET status=? WHERE depends_on_task_id=? AND status=?",
+		`UPDATE dag_tasks SET status=? WHERE id IN
+		 (SELECT task_id FROM task_dependencies WHERE depends_on_task_id=?)
+		 AND status=?`,
 		StatusPending, completedTaskID, StatusBlocked,
 	)
 	if err != nil {
@@ -398,11 +402,15 @@ func (s *Store) DetectCircular(fromID, toID int64) error {
 
 // FailDependents marks all tasks dependent on the failed task as failed.
 // Chain failure: if parent fails, children cannot proceed.
+// FailDependents marks all tasks dependent on the failed task as failed.
+// v3.0.1: Uses task_dependencies table (multi-parent), not legacy column.
 func (s *Store) FailDependents(failedTaskID int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	res, err := s.db.Exec(
-		"UPDATE dag_tasks SET status=? WHERE depends_on_task_id=? AND status=?",
+		`UPDATE dag_tasks SET status=? WHERE id IN
+		 (SELECT task_id FROM task_dependencies WHERE depends_on_task_id=?)
+		 AND status=?`,
 		StatusFailed, failedTaskID, StatusBlocked,
 	)
 	if err != nil {
