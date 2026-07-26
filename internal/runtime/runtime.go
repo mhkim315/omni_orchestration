@@ -436,23 +436,23 @@ func verifyAttachIdentity(pid int) (AttachIdentity, error) {
 	if len(fields) < 6 {
 		return AttachIdentity{}, fmt.Errorf("ps: unexpected output: %q", string(out))
 	}
-	// lstart format: "Mon Jul 28 01:23:45 2026" — convert to unix ms.
+	// Fix 1: lstart is LOCAL time, parse in local location, truncate to seconds.
 	startStr := strings.Join(fields[:5], " ")
-	t, err := time.Parse("Mon Jan 2 15:04:05 2006", startStr)
-	var startMs int64
+	t, err := time.ParseInLocation("Mon Jan 2 15:04:05 2006", startStr, time.Local)
+	var startSec int64
 	if err == nil {
-		startMs = t.UnixMilli()
+		startSec = t.Unix() // seconds, for comparison with ms/1000
 	}
 	executable := ""
 	if len(fields) >= 6 {
 		executable = fields[5]
 	}
-	return AttachIdentity{PID: pid, Executable: executable, StartTime: fmt.Sprintf("%d", startMs)}, nil
+	return AttachIdentity{PID: pid, Executable: executable, StartTime: fmt.Sprintf("%d", startSec)}, nil
 }
 
 // watchAttached polls kill(pid,0) until the process exits.
-// Uses wait4 with WNOHANG to attempt exit code capture for child processes.
-// For non-child attached processes, exit code is -1 (unknown).
+// Once dead, emits ExitEvent and closes the done channel.
+// For attached processes, exit code is -1 (unknown — not our child).
 func (r *Runtime) watchAttached(pid int) {
 	defer r.outputWg.Done()
 	defer close(r.output)
@@ -463,35 +463,14 @@ func (r *Runtime) watchAttached(pid int) {
 		case <-r.ctx.Done():
 			return
 		case <-ticker.C:
-			// Try wait4 for exit code (works only for child processes).
-			var wstatus syscall.WaitStatus
-			wpid, err := syscall.Wait4(pid, &wstatus, syscall.WNOHANG, nil)
-			if err != nil || wpid != pid {
-				// Not our child — fall back to kill(pid,0) liveness check.
-				if err2 := syscall.Kill(pid, 0); err2 != nil {
-					ev := ExitEvent{ExitedAt: time.Now(), ExitCode: -1}
-					r.doneOnce.Do(func() { r.exitVal = ev; close(r.done) })
-					r.mu.Lock()
-					r.closed = true
-					r.mu.Unlock()
-					return
-				}
-				continue
+			if err := syscall.Kill(pid, 0); err != nil {
+				ev := ExitEvent{ExitedAt: time.Now(), ExitCode: -1}
+				r.doneOnce.Do(func() { r.exitVal = ev; close(r.done) })
+				r.mu.Lock()
+				r.closed = true
+				r.mu.Unlock()
+				return
 			}
-			// Child exited — capture real exit code.
-			ev := ExitEvent{ExitedAt: time.Now()}
-			if wstatus.Exited() {
-				ev.ExitCode = wstatus.ExitStatus()
-			} else if wstatus.Signaled() {
-				ev.Signaled = true
-				ev.Signal = wstatus.Signal()
-				ev.ExitCode = -1
-			}
-			r.doneOnce.Do(func() { r.exitVal = ev; close(r.done) })
-			r.mu.Lock()
-			r.closed = true
-			r.mu.Unlock()
-			return
 		}
 	}
 }
