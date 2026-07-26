@@ -454,35 +454,43 @@ func (rc *runContext) allowedDecisions(result observeResult) []string {
 	}
 }
 
-// finalizeTerminal updates ALL status fields for a terminal run outcome.
-// Closes every tracked attempt worker, not just the current one.
+// finalizeTerminal closes worker runtimes and updates run/task status.
+// Each attempt keeps its own terminal status (not overwritten).
+// Only non-terminal workers are closed.
 func (rc *runContext) finalizeTerminal(ast *attemptState, status string) {
-	// Close ALL prior attempt workers.
+	// Close only non-terminal workers in tracked attempts.
 	for _, a := range rc.attempts {
 		if a.rt != nil {
 			a.rt.Close(context.Background(), a.rt.Generation())
 		}
-		if a.attempt != nil {
+		// Preserve existing attempt/worker status — don't overwrite.
+		if a.attempt != nil && !isTerminalAttempt(a.attempt.Status) {
 			rc.store.UpdateAttemptStatus(a.attempt.ID, status)
 		}
-		if a.worker != nil {
+		if a.worker != nil && !isTerminalWorker(a.worker.Status) {
 			rc.store.UpdateWorkerStatus(a.worker.ID, status)
 		}
 	}
-	// Close current attempt if not already in the list.
 	if ast != nil {
 		if ast.rt != nil {
 			ast.rt.Close(context.Background(), ast.rt.Generation())
 		}
-		if ast.attempt != nil {
+		if ast.attempt != nil && !isTerminalAttempt(ast.attempt.Status) {
 			rc.store.UpdateAttemptStatus(ast.attempt.ID, status)
 		}
-		if ast.worker != nil {
+		if ast.worker != nil && !isTerminalWorker(ast.worker.Status) {
 			rc.store.UpdateWorkerStatus(ast.worker.ID, status)
 		}
 	}
 	rc.store.UpdateRunStatus(rc.runID, status)
 	rc.store.UpdateTaskStatus(rc.taskID, status)
+}
+
+func isTerminalAttempt(s string) bool {
+	return s == taskstore.StatusCompleted || s == taskstore.StatusFailed || s == taskstore.StatusCancelled
+}
+func isTerminalWorker(s string) bool {
+	return s == taskstore.StatusCompleted || s == taskstore.StatusFailed || s == taskstore.StatusCancelled
 }
 
 // runValidatorBinary executes an external validator command.

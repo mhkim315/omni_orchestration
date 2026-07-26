@@ -203,7 +203,14 @@ func (s *Store) migrate() error {
 	);
 	`
 	_, err := s.db.Exec(ddl)
-	return err
+	if err != nil {
+		return err
+	}
+	// Migration: add pid/pgid/start_time_ms (ignore errors if already present).
+	s.db.Exec("ALTER TABLE workers ADD COLUMN pid INTEGER NOT NULL DEFAULT 0")
+	s.db.Exec("ALTER TABLE workers ADD COLUMN pgid INTEGER NOT NULL DEFAULT 0")
+	s.db.Exec("ALTER TABLE workers ADD COLUMN start_time_ms INTEGER NOT NULL DEFAULT 0")
+	return nil
 }
 
 // ── Runs ──
@@ -390,15 +397,32 @@ func (s *Store) GetRun(id int64) (*Run, error) { return s.getRun(id) }
 func (s *Store) RecordWorker(attemptID int64, command, cwd, role string, generation int64) (*WorkerRecord, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	nowMs := time.Now().UnixMilli()
 	res, err := s.db.Exec(
-		"INSERT INTO workers (attempt_id, command, cwd, role, generation, status) VALUES (?,?,?,?,?, 'running')",
-		attemptID, command, cwd, role, generation,
+		"INSERT INTO workers (attempt_id, command, cwd, role, generation, status, pid, pgid, start_time_ms) VALUES (?,?,?,?,?, 'running', ?, ?, ?)",
+		attemptID, command, cwd, role, generation, 0, 0, nowMs,
 	)
 	if err != nil {
 		return nil, err
 	}
 	id, _ := res.LastInsertId()
-	return &WorkerRecord{ID: id, AttemptID: attemptID, Command: command, CWD: cwd, Role: role, Generation: generation, Status: StatusRunning}, nil
+	return &WorkerRecord{ID: id, AttemptID: attemptID, Command: command, CWD: cwd, Role: role, Generation: generation, Status: StatusRunning, StartTime: nowMs}, nil
+}
+
+// RecordWorkerPID stores a worker with process identity for recovery.
+func (s *Store) RecordWorkerPID(attemptID int64, command, cwd, role string, generation int64, pid, pgid int) (*WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nowMs := time.Now().UnixMilli()
+	res, err := s.db.Exec(
+		"INSERT INTO workers (attempt_id, command, cwd, role, generation, status, pid, pgid, start_time_ms) VALUES (?,?,?,?,?, 'running', ?, ?, ?)",
+		attemptID, command, cwd, role, generation, pid, pgid, nowMs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return &WorkerRecord{ID: id, AttemptID: attemptID, Command: command, CWD: cwd, Role: role, Generation: generation, Status: StatusRunning, PID: pid, PGID: pgid, StartTime: nowMs}, nil
 }
 
 func (s *Store) UpdateWorkerStatus(id int64, status string) error {
