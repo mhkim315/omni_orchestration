@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"log"
 	"syscall"
+	"time"
 
 	"github.com/miinanii/omni_orchestration/internal/runtime"
+	"github.com/miinanii/omni_orchestration/internal/supervisor"
 	"github.com/miinanii/omni_orchestration/internal/taskstore"
 	"github.com/miinanii/omni_orchestration/internal/worktree"
 )
@@ -136,9 +138,10 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 				continue
 			}
 
-			// Attach to existing process — no new Start.
+			// Attach to existing process with identity verification.
 			rt := runtime.NewWithID(a.WorkerID, w.Generation)
-			if err := rt.Attach(w.PID); err != nil {
+			id := runtime.AttachIdentity{PID: w.PID, Executable: w.Command, StartTime: fmt.Sprintf("%d", w.StartTime)}
+			if err := rt.Attach(w.PID, id); err != nil {
 				log.Printf("RESUME: attempt %d attach pid %d failed: %v", a.ID, w.PID, err)
 				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
 				decisions = append(decisions, DecisionFail)
@@ -146,7 +149,18 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 			}
 			decisions = append(decisions, DecisionRetryClean)
 			store.UpdateAttemptStatus(a.ID, taskstore.StatusRunning)
-			log.Printf("RESUME: attempt %d worker %s attached to pid %d (gen=%d)", a.ID, a.WorkerID, w.PID, w.Generation)
+			log.Printf("RESUME: attempt %d worker %s attached to pid %d (exec=%s gen=%d)",
+				a.ID, a.WorkerID, w.PID, w.Command, w.Generation)
+
+			// Start supervisor+validator on attached runtime.
+			go func(rt *runtime.Runtime) {
+				cfg := supervisor.Config{QuiescenceTimeout: 30 * time.Second, PollInterval: 5 * time.Second}
+				sup := supervisor.New(cfg)
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				defer cancel()
+				for range sup.Observe(ctx, rt) {
+				}
+			}(rt)
 		}
 		return decisions, nil
 	}

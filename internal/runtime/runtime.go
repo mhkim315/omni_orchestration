@@ -18,6 +18,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -357,20 +358,111 @@ func (r *Runtime) PID() int {
 	return 0
 }
 
-// Attach verifies the given PID is alive and marks the Runtime as attached.
-// Returns an error if the PID does not exist (ESRCH). Fake PID → fail-closed.
-func (r *Runtime) Attach(pid int) error {
+// AttachIdentity holds verified process identity from procfs.
+type AttachIdentity struct {
+	PID        int
+	Executable string
+	CWD        string
+	StartTime  string // ps lstart format
+}
+
+// Attach verifies the given PID is alive, validates its identity, and
+// initializes the Runtime as an attached observer. The attached Runtime
+// can Observe() (empty channel), Wait() (polls kill(pid,0)), and
+// Close()/Interrupt() (sends signals to PID). No PTY is allocated.
+//
+// Fake PID or identity mismatch → fail-closed.
+func (r *Runtime) Attach(pid int, id AttachIdentity) error {
 	if pid <= 0 {
 		return ErrRuntimeNotStarted
 	}
-	// kill(pid, 0) verifies the process exists without sending a signal.
+	// kill(pid, 0) verifies the process exists.
 	if err := syscall.Kill(pid, 0); err != nil {
-		return fmt.Errorf("runtime: attach pid %d: %w", pid, err)
+		return fmt.Errorf("runtime: attach pid %d not alive: %w", pid, err)
 	}
+
+	// Verify identity via ps.
+	verified, err := verifyProcessIdentity(pid)
+	if err != nil {
+		return fmt.Errorf("runtime: attach verify pid %d: %w", pid, err)
+	}
+	// Cross-check provided identity against verified.
+	if id.Executable != "" && id.Executable != verified.Executable {
+		return fmt.Errorf("runtime: attach pid %d executable mismatch: stored=%q actual=%q", pid, id.Executable, verified.Executable)
+	}
+
 	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.ctx, r.cancel = context.WithCancel(context.Background())
 	r.started = true
-	r.mu.Unlock()
+	r.gen++
+	r.id = fmt.Sprintf("attached-%d", pid)
+
+	// Create a synthetic cmd for Close/Interrupt signal delivery.
+	r.cmd = &exec.Cmd{Process: &os.Process{Pid: pid}}
+
+	// Empty output channel — no PTY to read.
+	r.output = make(chan string, 1)
+	r.outputCtx = func() {}
+
+	// Start exit watcher that polls kill(pid, 0).
+	r.outputWg.Add(1)
+	go r.watchAttached(pid)
+
 	return nil
+}
+
+// verifyProcessIdentity reads /proc or uses ps to identify a process.
+func verifyProcessIdentity(pid int) (AttachIdentity, error) {
+	cmd := exec.Command("ps", "-p", fmt.Sprintf("%d", pid), "-o", "lstart=,comm=")
+	out, err := cmd.Output()
+	if err != nil {
+		return AttachIdentity{}, fmt.Errorf("ps: %w", err)
+	}
+	fields := strings.Fields(strings.TrimSpace(string(out)))
+	if len(fields) < 6 {
+		return AttachIdentity{}, fmt.Errorf("ps: unexpected output: %q", string(out))
+	}
+	// ps lstart format: "Mon Jul 28 01:23:45 2026"
+	startTime := strings.Join(fields[:5], " ")
+	executable := ""
+	if len(fields) >= 6 {
+		executable = fields[5]
+	}
+	return AttachIdentity{PID: pid, Executable: executable, StartTime: startTime}, nil
+}
+
+// watchAttached polls kill(pid, 0) until the process exits.
+func (r *Runtime) watchAttached(pid int) {
+	defer r.outputWg.Done()
+	defer close(r.output)
+
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case <-ticker.C:
+			if err := syscall.Kill(pid, 0); err != nil {
+				// Process exited.
+				ev := ExitEvent{ExitedAt: time.Now()}
+				if errors.Is(err, syscall.ESRCH) {
+					ev.ExitCode = 0 // unknown exit code
+				}
+				r.doneOnce.Do(func() {
+					r.exitVal = ev
+					close(r.done)
+				})
+				r.mu.Lock()
+				r.closed = true
+				r.mu.Unlock()
+				return
+			}
+		}
+	}
 }
 
 // ── Internal ──
