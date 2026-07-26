@@ -50,12 +50,20 @@ func Reconcile(store *taskstore.Store, wt *worktree.Manager) ReconcileResult {
 		// Only mark as interrupted if there's NO checkpoint (never started).
 		// Attempts with checkpoints are re-own candidates, not interrupted.
 		if a.CheckpointCommit == "" {
-			if err := store.UpdateAttemptStatus(a.ID, StatusInterrupted); err != nil {
-				r.Errors = append(r.Errors, fmt.Sprintf("update attempt %d: %v", a.ID, err))
-				continue
+			// Resolve run/task/worker IDs for full terminalization.
+			taskID := a.TaskID
+			var runID int64
+			if t, err := store.GetTask(taskID); err == nil {
+				runID = t.RunID
 			}
+			if w, err := store.GetWorkerByAttempt(a.ID); err == nil {
+				store.UpdateWorkerStatus(w.ID, StatusInterrupted)
+			}
+			store.UpdateAttemptStatus(a.ID, StatusInterrupted)
+			store.UpdateRunStatus(runID, StatusInterrupted)
+			store.UpdateTaskStatus(taskID, StatusInterrupted)
 			r.Interrupted++
-			log.Printf("RECOVERY: attempt %d (no checkpoint) marked interrupted", a.ID)
+			log.Printf("RECOVERY: attempt %d (no checkpoint) fully terminalized", a.ID)
 		} else {
 			cpshort := a.CheckpointCommit
 			if len(cpshort) > 8 {
