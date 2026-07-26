@@ -238,6 +238,10 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 			log.Printf("B-R1: coordinator wake failed: %v — defaulting to RETRY_CLEAN", err)
 			resp = coordinator.WakeResponse{Decision: DecisionRetryClean, Reason: "wake failed", NextInstruction: cfg.Task}
 		}
+		// C2: no-coordinator flow — validator PASS → auto-COMPLETE.
+		if rc.cfg.Coordinator == nil && result.validatorPassed {
+			resp = coordinator.WakeResponse{Decision: DecisionComplete, Reason: "validator passed (no coordinator)", NextInstruction: ""}
+		}
 		rc.decisions = append(rc.decisions, resp.Decision)
 
 		if resp.Decision == DecisionComplete {
@@ -289,7 +293,13 @@ func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instructi
 	if cwd == "" {
 		cwd = info.Path
 	}
-	// C5: Validate CWD is within worktree boundary.
+	// C5: Resolve symlinks before boundary check (macOS /var→/private/var).
+	if r, e := filepath.EvalSymlinks(cwd); e == nil {
+		cwd = r
+	}
+	if r, e := filepath.EvalSymlinks(info.Path); e == nil {
+		info.Path = r
+	}
 	if cwd != info.Path && !isWithinWorktree(cwd, info.Path) {
 		rc.wt.Remove(info.Path)
 		return nil, fmt.Errorf("CWD %q is outside worktree %q", cwd, info.Path)
