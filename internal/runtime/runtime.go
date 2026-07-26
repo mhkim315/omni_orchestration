@@ -357,6 +357,22 @@ func (r *Runtime) PID() int {
 	return 0
 }
 
+// Attach verifies the given PID is alive and marks the Runtime as attached.
+// Returns an error if the PID does not exist (ESRCH). Fake PID → fail-closed.
+func (r *Runtime) Attach(pid int) error {
+	if pid <= 0 {
+		return ErrRuntimeNotStarted
+	}
+	// kill(pid, 0) verifies the process exists without sending a signal.
+	if err := syscall.Kill(pid, 0); err != nil {
+		return fmt.Errorf("runtime: attach pid %d: %w", pid, err)
+	}
+	r.mu.Lock()
+	r.started = true
+	r.mu.Unlock()
+	return nil
+}
+
 // ── Internal ──
 
 func (r *Runtime) readOutput(ctx context.Context, rdr io.Reader) {

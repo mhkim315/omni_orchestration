@@ -444,6 +444,19 @@ func (s *Store) GetWorker(id int64) (*WorkerRecord, error) {
 	return &w, nil
 }
 
+// GetWorkerByAttempt reads the first worker for a given attempt ID.
+func (s *Store) GetWorkerByAttempt(attemptID int64) (*WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row := s.db.QueryRow("SELECT id, attempt_id, command, cwd, role, generation, status, pid, pgid, start_time_ms FROM workers WHERE attempt_id=? ORDER BY id DESC LIMIT 1", attemptID)
+	var w WorkerRecord
+	err := row.Scan(&w.ID, &w.AttemptID, &w.Command, &w.CWD, &w.Role, &w.Generation, &w.Status, &w.PID, &w.PGID, &w.StartTime)
+	if err != nil {
+		return nil, err
+	}
+	return &w, nil
+}
+
 func (s *Store) UpdateWorkerStatus(id int64, status string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

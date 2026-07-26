@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"syscall"
 
 	"github.com/miinanii/omni_orchestration/internal/runtime"
 	"github.com/miinanii/omni_orchestration/internal/taskstore"
@@ -116,27 +117,36 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 		log.Printf("RESUME: %d active attempts after reconcile — re-owning", len(active))
 		var decisions []Decision
 		for _, a := range active {
-			// Validate stored PID from DB before re-attach.
-			w, err := store.GetWorker(a.ID)
+			// Look up worker by attempt ID (worker primary key, not attempt ID).
+			w, err := store.GetWorkerByAttempt(a.ID)
 			if err != nil {
 				log.Printf("RESUME: attempt %d no worker record: %v", a.ID, err)
 				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
 				decisions = append(decisions, DecisionFail)
 				continue
 			}
-			log.Printf("RESUME: attempt %d worker pid=%d pgid=%d start=%d", a.ID, w.PID, w.PGID, w.StartTime)
+			log.Printf("RESUME: attempt %d worker pid=%d pgid=%d start=%d cmd=%s gen=%d",
+				a.ID, w.PID, w.PGID, w.StartTime, w.Command, w.Generation)
 
-			// Attach real runtime only if stored PID validates.
-			rt := runtime.NewWithID(a.WorkerID, 1)
-			if err := rt.Start(cfg.Command, cfg.CWD); err != nil {
-				log.Printf("RESUME: attempt %d worker %s restart failed: %v", a.ID, a.WorkerID, err)
+			// kill(pid, 0) verifies process is alive.
+			if err := syscall.Kill(w.PID, 0); err != nil {
+				log.Printf("RESUME: attempt %d pid %d not alive: %v — fail closed", a.ID, w.PID, err)
+				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
+				decisions = append(decisions, DecisionFail)
+				continue
+			}
+
+			// Attach to existing process — no new Start.
+			rt := runtime.NewWithID(a.WorkerID, w.Generation)
+			if err := rt.Attach(w.PID); err != nil {
+				log.Printf("RESUME: attempt %d attach pid %d failed: %v", a.ID, w.PID, err)
 				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
 				decisions = append(decisions, DecisionFail)
 				continue
 			}
 			decisions = append(decisions, DecisionRetryClean)
 			store.UpdateAttemptStatus(a.ID, taskstore.StatusRunning)
-			log.Printf("RESUME: attempt %d worker %s re-owned (stored-pid=%d actual-pid=%d)", a.ID, a.WorkerID, w.PID, rt.PID())
+			log.Printf("RESUME: attempt %d worker %s attached to pid %d (gen=%d)", a.ID, a.WorkerID, w.PID, w.Generation)
 		}
 		return decisions, nil
 	}
