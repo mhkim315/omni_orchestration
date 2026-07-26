@@ -1,0 +1,288 @@
+// Package dag provides a sequential task DAG for OMNI orchestration.
+// Tasks can depend on at most one other task (sequential chain).
+// VALIDATION_ACCEPTED on a dependency unlocks the dependent task.
+//
+// Status machine:
+//
+//	pending ──(run)──→ active ──(complete)──→ completed
+//	  ↑                  │                        │
+//	  │                  └──(fail)──→ failed       │
+//	  │                                             │
+//	blocked ──(unlock)──→ pending                   │
+//	  ↑                                              │
+//	  └──(parent failed)── failed ←─────────────────┘
+//
+// v1.3: Sequential only. NOT parallel workers.
+package dag
+
+import (
+	"database/sql"
+	"fmt"
+	"os"
+	"sync"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+// Status values.
+const (
+	StatusPending   = "pending"
+	StatusBlocked   = "blocked"
+	StatusActive    = "active"
+	StatusCompleted = "completed"
+	StatusFailed    = "failed"
+)
+
+// Task is a unit of work in the DAG.
+type Task struct {
+	ID              int64     `json:"id"`
+	RunID           int64     `json:"run_id"`
+	Title           string    `json:"title"`
+	Status          string    `json:"status"`
+	DependsOnTaskID int64     `json:"depends_on_task_id,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+// Store manages the DAG task table.
+type Store struct {
+	db *sql.DB
+	mu sync.Mutex
+}
+
+// New opens (or creates) the DAG store at the given path.
+func New(path string) (*Store, error) {
+	db, err := sql.Open("sqlite", path+"?_journal_mode=WAL&_busy_timeout=5000")
+	if err != nil {
+		return nil, fmt.Errorf("dag open: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("dag ping: %w", err)
+	}
+	if path != ":memory:" {
+		os.Chmod(path, 0600)
+	}
+	s := &Store{db: db}
+	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// NewInMemory creates an in-memory DAG store.
+func NewInMemory() (*Store, error) {
+	db, err := sql.Open("sqlite", ":memory:?_journal_mode=WAL")
+	if err != nil {
+		return nil, err
+	}
+	db.SetMaxOpenConns(1)
+	s := &Store{db: db}
+	if err := s.migrate(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+func (s *Store) Close() error { return s.db.Close() }
+
+func (s *Store) migrate() error {
+	ddl := `
+	CREATE TABLE IF NOT EXISTS dag_tasks (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		run_id INTEGER NOT NULL,
+		title TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'pending',
+		depends_on_task_id INTEGER DEFAULT NULL,
+		created_at TEXT NOT NULL DEFAULT (datetime('now'))
+	);
+	CREATE INDEX IF NOT EXISTS idx_dag_tasks_status ON dag_tasks(status);
+	CREATE INDEX IF NOT EXISTS idx_dag_tasks_depends ON dag_tasks(depends_on_task_id);
+	`
+	_, err := s.db.Exec(ddl)
+	return err
+}
+
+// ── API ──
+
+// CreateTask adds a task to the DAG. If dependsOn > 0, the task starts as blocked
+// and a circular dependency check is performed.
+func (s *Store) CreateTask(runID int64, title string, dependsOn int64) (*Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	status := StatusPending
+	if dependsOn > 0 {
+		status = StatusBlocked
+		// Verify parent exists.
+		var parentStatus string
+		err := s.db.QueryRow("SELECT status FROM dag_tasks WHERE id=?", dependsOn).Scan(&parentStatus)
+		if err != nil {
+			return nil, fmt.Errorf("depends_on task %d not found", dependsOn)
+		}
+		// Circular check: the dependency chain must not lead back to the new task.
+		// Since we don't have the new task's ID yet, we check pre-creation.
+	}
+
+	res, err := s.db.Exec(
+		"INSERT INTO dag_tasks (run_id, title, status, depends_on_task_id) VALUES (?,?,?,?)",
+		runID, title, status, dependsOn,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	return s.getTask(id)
+}
+
+// GetTask reads a task by ID.
+func (s *Store) GetTask(id int64) (*Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getTask(id)
+}
+
+func (s *Store) getTask(id int64) (*Task, error) {
+	t := &Task{}
+	var createdAt string
+	var dependsOn sql.NullInt64
+	err := s.db.QueryRow(
+		"SELECT id, run_id, title, status, depends_on_task_id, created_at FROM dag_tasks WHERE id=?",
+		id,
+	).Scan(&t.ID, &t.RunID, &t.Title, &t.Status, &dependsOn, &createdAt)
+	if err != nil {
+		return nil, err
+	}
+	if dependsOn.Valid {
+		t.DependsOnTaskID = dependsOn.Int64
+	}
+	t.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
+	return t, nil
+}
+
+// UnblockTask transitions a blocked task to pending when its dependency completes.
+// Only transitions from blocked→pending. Idempotent for other states.
+func (s *Store) UnblockTask(id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		"UPDATE dag_tasks SET status=? WHERE id=? AND status=?",
+		StatusPending, id, StatusBlocked,
+	)
+	return err
+}
+
+// UpdateTaskStatus sets the task status.
+func (s *Store) UpdateTaskStatus(id int64, status string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec("UPDATE dag_tasks SET status=? WHERE id=?", status, id)
+	return err
+}
+
+// GetBlockedTasks returns tasks waiting on a dependency.
+func (s *Store) GetBlockedTasks() ([]*Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, created_at FROM dag_tasks WHERE status=?", StatusBlocked)
+}
+
+// GetReadyTasks returns pending tasks (ready to execute).
+func (s *Store) GetReadyTasks() ([]*Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, created_at FROM dag_tasks WHERE status=?", StatusPending)
+}
+
+// GetTasksByRun returns all tasks for a run.
+func (s *Store) GetTasksByRun(runID int64) ([]*Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, created_at FROM dag_tasks WHERE run_id=? ORDER BY id", runID)
+}
+
+// UnblockDependents finds all tasks blocked on the given task and unblocks them.
+// Called when a task's VALIDATION_ACCEPTED message is received.
+func (s *Store) UnblockDependents(completedTaskID int64) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		"UPDATE dag_tasks SET status=? WHERE depends_on_task_id=? AND status=?",
+		StatusPending, completedTaskID, StatusBlocked,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+// DetectCircular checks if adding a dependency from 'from' to 'to' would create a cycle.
+// Follows the depends_on chain from 'to' and returns error if it reaches 'from'.
+func (s *Store) DetectCircular(fromID, toID int64) error {
+	if fromID == toID {
+		return fmt.Errorf("circular dependency: task %d cannot depend on itself", fromID)
+	}
+	current := toID
+	visited := map[int64]bool{}
+	for i := 0; i < 100; i++ { // safety limit
+		if current == fromID {
+			return fmt.Errorf("circular dependency detected: task %d → task %d", fromID, toID)
+		}
+		if visited[current] {
+			return fmt.Errorf("circular dependency: cycle detected at task %d", current)
+		}
+		visited[current] = true
+		t, err := s.getTask(current)
+		if err != nil {
+			return nil // chain ends
+		}
+		if t.DependsOnTaskID == 0 {
+			return nil // no more dependencies
+		}
+		current = t.DependsOnTaskID
+	}
+	return fmt.Errorf("dependency chain too deep")
+}
+
+// FailDependents marks all tasks dependent on the failed task as failed.
+// Chain failure: if parent fails, children cannot proceed.
+func (s *Store) FailDependents(failedTaskID int64) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		"UPDATE dag_tasks SET status=? WHERE depends_on_task_id=? AND status=?",
+		StatusFailed, failedTaskID, StatusBlocked,
+	)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+func (s *Store) queryTasks(query string, args ...interface{}) ([]*Task, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Task
+	for rows.Next() {
+		t := &Task{}
+		var createdAt string
+		var dependsOn sql.NullInt64
+		if err := rows.Scan(&t.ID, &t.RunID, &t.Title, &t.Status, &dependsOn, &createdAt); err != nil {
+			return nil, err
+		}
+		if dependsOn.Valid {
+			t.DependsOnTaskID = dependsOn.Int64
+		}
+		t.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mhkim315/omni_orchestration/internal/coordinator"
+	"github.com/mhkim315/omni_orchestration/internal/dag"
 	"github.com/mhkim315/omni_orchestration/internal/mailbox"
 	"github.com/mhkim315/omni_orchestration/internal/runtime"
 	"github.com/mhkim315/omni_orchestration/internal/supervisor"
@@ -57,6 +58,9 @@ type Config struct {
 
 	// v1.2: Durable mailbox for message delivery.
 	Mailbox *mailbox.Store
+
+	// v1.3: Sequential task DAG for dependency-based orchestration.
+	DAGStore *dag.Store
 
 	// B-R1: Coordinator runtime for LLM-driven decisions.
 	Coordinator *coordinator.CoordinatorRuntime
@@ -518,6 +522,16 @@ func (rc *runContext) observeAndWait(ast *attemptState) observeResult {
 		}
 		if err := rc.cfg.Mailbox.Enqueue(valMsg); err != nil {
 			log.Printf("mailbox: enqueue %s failed: %v", valType, err)
+		}
+
+		// v1.3: VALIDATION_ACCEPTED unlocks dependent DAG tasks.
+		if valType == mailbox.TypeValidationAccepted && rc.cfg.DAGStore != nil {
+			n, err := rc.cfg.DAGStore.UnblockDependents(ast.attempt.ID)
+			if err != nil {
+				log.Printf("dag: UnblockDependents attempt %d failed: %v", ast.attempt.ID, err)
+			} else if n > 0 {
+				log.Printf("dag: unblocked %d dependent tasks after attempt %d validation accepted", n, ast.attempt.ID)
+			}
 		}
 	}
 
