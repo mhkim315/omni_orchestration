@@ -379,6 +379,7 @@ func resultAdopt(store *taskstore.Store, target string) error {
 		return fmt.Errorf("no run_record for run %d: %w", runID, err)
 	}
 	if err := store.RecordAdoption(runID, chosen.Number, true); err != nil {
+		store.UpdateRunStatus(runID, taskstore.StatusFailed)
 		return fmt.Errorf("adopt: %w", err)
 	}
 	fmt.Printf("Run #%d — Attempt #%d adopted \u2713\n", runID, chosen.Number)
