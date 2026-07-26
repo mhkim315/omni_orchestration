@@ -107,11 +107,12 @@ func (g *DecisionGateway) IsDuplicate(key string) bool {
 
 // RecordEffect persists an effect key to the durable store.
 // R2 Fix 4: durable effect key write to SQLite.
+// RecordEffect atomically records an effect key. Returns true if newly
+// inserted (rowsAffected=1), false if already existed. R7: single INSERT OR IGNORE.
 func (g *DecisionGateway) RecordEffect(key string) (bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.store == nil {
-		// In-memory only — always records.
 		if g.seenKeys[key] {
 			return false, nil
 		}
@@ -307,6 +308,8 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 			if _, err := rc.store.GetRunRecord(rc.runID); err == nil {
 				if err := rc.store.RecordAdoption(rc.runID, attemptNum, true); err != nil {
 					log.Printf("R2: RecordAdoption failed: %v", err)
+					rc.store.UpdateRunStatus(rc.runID, taskstore.StatusFailed)
+					rc.store.UpdateAttemptStatus(ast.attempt.ID, taskstore.StatusFailed)
 				}
 			} else {
 				log.Printf("R2: no run_record for run %d — skipping adoption", rc.runID)
