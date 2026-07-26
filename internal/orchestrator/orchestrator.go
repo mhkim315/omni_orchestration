@@ -404,6 +404,10 @@ func (rc *runContext) observeAndWait(ast *attemptState) observeResult {
 		status = taskstore.StatusFailed
 	}
 	rc.store.UpdateAttemptStatus(ast.attempt.ID, status)
+	rc.store.UpdateWorkerStatus(ast.worker.ID, status)
+	// Update in-memory so finalizeTerminal reads current state.
+	ast.attempt.Status = status
+	ast.worker.Status = status
 
 	return observeResult{
 		state: finalState, checkpoint: checkpointSHA, exited: exited,
@@ -463,23 +467,31 @@ func (rc *runContext) finalizeTerminal(ast *attemptState, status string) {
 		if a.rt != nil {
 			a.rt.Close(context.Background(), a.rt.Generation())
 		}
-		// Preserve existing attempt/worker status — don't overwrite.
-		if a.attempt != nil && !isTerminalAttempt(a.attempt.Status) {
-			rc.store.UpdateAttemptStatus(a.attempt.ID, status)
+		// Read current DB status before overwrite — in-memory may be stale.
+		if a.attempt != nil {
+			if cur, err := rc.store.GetAttempt(a.attempt.ID); err == nil && !isTerminalAttempt(cur.Status) {
+				rc.store.UpdateAttemptStatus(a.attempt.ID, status)
+			}
 		}
-		if a.worker != nil && !isTerminalWorker(a.worker.Status) {
-			rc.store.UpdateWorkerStatus(a.worker.ID, status)
+		if a.worker != nil {
+			if cur, err := rc.store.GetWorker(a.worker.ID); err == nil && !isTerminalWorker(cur.Status) {
+				rc.store.UpdateWorkerStatus(a.worker.ID, status)
+			}
 		}
 	}
 	if ast != nil {
 		if ast.rt != nil {
 			ast.rt.Close(context.Background(), ast.rt.Generation())
 		}
-		if ast.attempt != nil && !isTerminalAttempt(ast.attempt.Status) {
-			rc.store.UpdateAttemptStatus(ast.attempt.ID, status)
+		if ast.attempt != nil {
+			if cur, err := rc.store.GetAttempt(ast.attempt.ID); err == nil && !isTerminalAttempt(cur.Status) {
+				rc.store.UpdateAttemptStatus(ast.attempt.ID, status)
+			}
 		}
-		if ast.worker != nil && !isTerminalWorker(ast.worker.Status) {
-			rc.store.UpdateWorkerStatus(ast.worker.ID, status)
+		if ast.worker != nil {
+			if cur, err := rc.store.GetWorker(ast.worker.ID); err == nil && !isTerminalWorker(cur.Status) {
+				rc.store.UpdateWorkerStatus(ast.worker.ID, status)
+			}
 		}
 	}
 	rc.store.UpdateRunStatus(rc.runID, status)

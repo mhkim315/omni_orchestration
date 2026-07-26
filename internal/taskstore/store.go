@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -206,10 +207,15 @@ func (s *Store) migrate() error {
 	if err != nil {
 		return err
 	}
-	// Migration: add pid/pgid/start_time_ms (ignore errors if already present).
-	s.db.Exec("ALTER TABLE workers ADD COLUMN pid INTEGER NOT NULL DEFAULT 0")
-	s.db.Exec("ALTER TABLE workers ADD COLUMN pgid INTEGER NOT NULL DEFAULT 0")
-	s.db.Exec("ALTER TABLE workers ADD COLUMN start_time_ms INTEGER NOT NULL DEFAULT 0")
+	// Migration: add pid/pgid/start_time_ms. Ignore "duplicate column" errors.
+	for _, col := range []string{"pid", "pgid", "start_time_ms"} {
+		if _, err := s.db.Exec("ALTER TABLE workers ADD COLUMN " + col + " INTEGER NOT NULL DEFAULT 0"); err != nil {
+			// SQLite error "duplicate column name" is expected on re-run.
+			if !strings.Contains(err.Error(), "duplicate") {
+				return fmt.Errorf("alter workers add %s: %w", col, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -423,6 +429,19 @@ func (s *Store) RecordWorkerPID(attemptID int64, command, cwd, role string, gene
 	}
 	id, _ := res.LastInsertId()
 	return &WorkerRecord{ID: id, AttemptID: attemptID, Command: command, CWD: cwd, Role: role, Generation: generation, Status: StatusRunning, PID: pid, PGID: pgid, StartTime: nowMs}, nil
+}
+
+// GetWorker reads a worker record from the database.
+func (s *Store) GetWorker(id int64) (*WorkerRecord, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	row := s.db.QueryRow("SELECT id, attempt_id, command, cwd, role, generation, status, pid, pgid, start_time_ms FROM workers WHERE id=?", id)
+	var w WorkerRecord
+	err := row.Scan(&w.ID, &w.AttemptID, &w.Command, &w.CWD, &w.Role, &w.Generation, &w.Status, &w.PID, &w.PGID, &w.StartTime)
+	if err != nil {
+		return nil, err
+	}
+	return &w, nil
 }
 
 func (s *Store) UpdateWorkerStatus(id int64, status string) error {
