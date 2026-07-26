@@ -126,7 +126,13 @@ func run() error {
 }
 
 func recoverCmd() error {
+	// P0-2: accept --store flag like run command.
 	storePath := filepath.Join(os.TempDir(), "omni-orchestrator.db")
+	for i, a := range os.Args {
+		if a == "--store" && i+1 < len(os.Args) {
+			storePath = os.Args[i+1]
+		}
+	}
 	store, err := orchestrator.OpenStore(storePath)
 	if err != nil {
 		return fmt.Errorf("store: %w", err)
@@ -137,8 +143,8 @@ func recoverCmd() error {
 	if len(result.Errors) > 0 {
 		return fmt.Errorf("recovery had %d errors", len(result.Errors))
 	}
-	log.Printf("Recovery complete: %d orphan runs, %d interrupted",
-		result.OrphanRuns, result.Interrupted)
+	log.Printf("Recovery complete: %d orphan runs, %d interrupted (store=%s)",
+		result.OrphanRuns, result.Interrupted, storePath)
 	return nil
 }
 
@@ -322,6 +328,10 @@ func resultAdopt(store *taskstore.Store, target string) error {
 	}
 	last := attempts[len(attempts)-1]
 
+	// P0-2: verify run_record exists before adoption.
+	if _, err := store.GetRunRecord(runID); err != nil {
+		return fmt.Errorf("no run_record for run %d: %w", runID, err)
+	}
 	if err := store.RecordAdoption(runID, last.Number, true); err != nil {
 		return fmt.Errorf("adopt: %w", err)
 	}

@@ -194,4 +194,38 @@ func TestRecovery_ResumeWithRecovery(t *testing.T) {
 	t.Logf("resume decisions: %v", decisions)
 }
 
+// TestRuntimeAttachRealProcess verifies Attach on a live process.
+func TestRuntimeAttachRealProcess(t *testing.T) {
+	// Start a real process.
+	rt := runtime.New()
+	if err := rt.Start("sleep 30", "/tmp"); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	pid := rt.PID()
+	if pid <= 0 {
+		t.Fatal("no PID after Start")
+	}
+	t.Logf("started process pid=%d", pid)
+
+	// Attach to the running process.
+	rt2 := runtime.NewWithID("attached-1", 1)
+	id := runtime.AttachIdentity{PID: pid, Executable: "sleep"}
+	if err := rt2.Attach(pid, id, 1); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+	if rt2.PID() != pid {
+		t.Errorf("attached PID=%d, want %d", rt2.PID(), pid)
+	}
+
+	// Fake PID must fail.
+	rt3 := runtime.NewWithID("fake", 1)
+	if err := rt3.Attach(99999, runtime.AttachIdentity{PID: 99999}, 1); err == nil {
+		t.Error("fake PID should fail")
+	}
+
+	// Clean up.
+	rt.Close(context.Background(), rt.Generation())
+	rt.Wait()
+}
+
 // runGit is defined in orchestrator_test.go
