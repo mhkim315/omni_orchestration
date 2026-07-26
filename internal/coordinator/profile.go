@@ -1,5 +1,10 @@
 package coordinator
 
+// EffectiveModelUnverified is used when a provider cannot confirm which
+// model actually served the request. This prevents unverified data from
+// polluting routing statistics.
+const EffectiveModelUnverified = "unverified"
+
 // AgentProfile captures the agent configuration used for a coordinator call.
 // Native values are preserved — no forced common enum.
 type AgentProfile struct {
@@ -7,6 +12,13 @@ type AgentProfile struct {
 	Model    string `json:"model"`    // provider-native model string
 	Mode     string `json:"mode"`     // provider-native effort/reasoning value
 	Role     string `json:"role"`     // "coordinator" | "worker" | "validator"
+}
+
+// RunRecord captures what model was requested vs. what actually served.
+type RunRecord struct {
+	RequestedModel string `json:"requested_model"` // from AgentProfile
+	ResolvedModel  string `json:"resolved_model"`  // provider-reported (or "unverified")
+	EffectiveModel string `json:"effective_model"` // confirmed model used (or "unverified")
 }
 
 // Capabilities describes what model/effort controls a provider supports.
@@ -80,6 +92,7 @@ func (c *ReasonixCoordinator) Profile() AgentProfile {
 // ApplyProfile sets model/effort from a profile onto the coordinator.
 func (c *CodexCoordinator) ApplyProfile(p AgentProfile) {
 	if p.Model != "" {
+		c.requestedModel = p.Model
 		c.Model = p.Model
 	}
 }
@@ -87,6 +100,7 @@ func (c *CodexCoordinator) ApplyProfile(p AgentProfile) {
 // ApplyProfile sets model/effort from a profile onto the coordinator.
 func (c *ClaudeCoordinator) ApplyProfile(p AgentProfile) {
 	if p.Model != "" {
+		c.requestedModel = p.Model
 		c.Model = p.Model
 	}
 	if p.Mode != "" {
@@ -97,6 +111,7 @@ func (c *ClaudeCoordinator) ApplyProfile(p AgentProfile) {
 // ApplyProfile sets model/effort from a profile onto the coordinator.
 func (c *AGYCoordinator) ApplyProfile(p AgentProfile) {
 	if p.Model != "" {
+		c.requestedModel = p.Model
 		c.Model = p.Model
 	}
 	if p.Mode != "" {
@@ -107,6 +122,41 @@ func (c *AGYCoordinator) ApplyProfile(p AgentProfile) {
 // ApplyProfile sets model/effort from a profile onto the coordinator.
 func (c *ReasonixCoordinator) ApplyProfile(p AgentProfile) {
 	if p.Model != "" {
+		c.requestedModel = p.Model
 		c.Model = p.Model
+	}
+}
+
+// RecordRun returns the model verification record for a completed run.
+// If the provider cannot confirm which model actually served, EffectiveModel
+// is "unverified" — never silently assumed to match the requested model.
+func (c *CodexCoordinator) RecordRun() RunRecord {
+	return RunRecord{
+		RequestedModel: c.requestedModel,
+		EffectiveModel: EffectiveModelUnverified,
+	}
+}
+
+// RecordRun returns the model verification record for a completed run.
+func (c *ClaudeCoordinator) RecordRun() RunRecord {
+	return RunRecord{
+		RequestedModel: c.requestedModel,
+		EffectiveModel: EffectiveModelUnverified,
+	}
+}
+
+// RecordRun returns the model verification record for a completed run.
+func (c *AGYCoordinator) RecordRun() RunRecord {
+	return RunRecord{
+		RequestedModel: c.requestedModel,
+		EffectiveModel: EffectiveModelUnverified,
+	}
+}
+
+// RecordRun returns the model verification record for a completed run.
+func (c *ReasonixCoordinator) RecordRun() RunRecord {
+	return RunRecord{
+		RequestedModel: c.requestedModel,
+		EffectiveModel: EffectiveModelUnverified,
 	}
 }

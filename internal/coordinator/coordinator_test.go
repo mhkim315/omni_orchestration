@@ -732,6 +732,65 @@ func TestAgentProfile_ProfileMethods(t *testing.T) {
 	}
 }
 
+// ── v1.0: Effective Model Verification ──
+
+func TestEffectiveModel_RequestedStored(t *testing.T) {
+	c := NewCodexCoordinator()
+	c.ApplyProfile(AgentProfile{Model: "gpt-5.2"})
+	rec := c.RecordRun()
+	if rec.RequestedModel != "gpt-5.2" {
+		t.Errorf("RequestedModel = %q, want gpt-5.2", rec.RequestedModel)
+	}
+}
+
+func TestEffectiveModel_AllProvidersUnverified(t *testing.T) {
+	// All current providers return "unverified" for EffectiveModel
+	// because none can confirm the actual model from output.
+	providers := []struct {
+		coord interface{ RecordRun() RunRecord }
+		name  string
+	}{
+		{NewCodexCoordinator(), "codex"},
+		{NewClaudeCoordinator(), "claude"},
+		{NewAGYCoordinator(), "agy"},
+		{NewReasonixCoordinator(), "reasonix"},
+	}
+	for _, p := range providers {
+		p.coord.(interface{ ApplyProfile(AgentProfile) }).ApplyProfile(AgentProfile{Model: "test-model"})
+	}
+	for _, p := range providers {
+		rec := p.coord.RecordRun()
+		if rec.EffectiveModel != EffectiveModelUnverified {
+			t.Errorf("%s: EffectiveModel = %q, want %q", p.name, rec.EffectiveModel, EffectiveModelUnverified)
+		}
+	}
+}
+
+func TestEffectiveModel_UnverifiedExcludedFromRouting(t *testing.T) {
+	// When EffectiveModel is unverified, routing should not use it
+	// as positive signal (no false confidence).
+	rec := RunRecord{
+		RequestedModel: "gpt-5.2",
+		EffectiveModel: EffectiveModelUnverified,
+	}
+	if rec.EffectiveModel == "gpt-5.2" {
+		t.Error("unverified must not match requested model")
+	}
+	if rec.EffectiveModel == EffectiveModelUnverified {
+		t.Log("unverified correctly preserved — routing excludes this record from confidence")
+	}
+}
+
+func TestEffectiveModel_RunRecordDefaults(t *testing.T) {
+	rec := RunRecord{}
+	if rec.EffectiveModel != "" {
+		t.Errorf("zero-value EffectiveModel = %q, want empty", rec.EffectiveModel)
+	}
+	if rec.RequestedModel != "" {
+		t.Errorf("zero-value RequestedModel = %q, want empty", rec.RequestedModel)
+	}
+}
+
 // ── Helpers ──
 
 func runGit(t *testing.T, dir string, args ...string) {

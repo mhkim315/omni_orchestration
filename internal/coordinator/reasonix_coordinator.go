@@ -15,9 +15,10 @@ import (
 // Reasonix has no built-in timeout and exhibits 14-30s latency. The
 // coordinator wraps every call with a 180s context timeout.
 type ReasonixCoordinator struct {
-	Bin     string // path to reasonix CLI (default: "reasonix")
-	Model   string // model override in provider/model format (optional)
-	Timeout time.Duration
+	Bin            string // path to reasonix CLI (default: "reasonix")
+	Model          string // model override in provider/model format (optional)
+	Timeout        time.Duration
+	requestedModel string // set by ApplyProfile
 }
 
 // NewReasonixCoordinator returns a Reasonix-backed coordinator.

@@ -15,9 +15,10 @@ import (
 // The contract is identical to CodexCoordinator — same prompt format,
 // same JSON response schema, same decision vocabulary.
 type ClaudeCoordinator struct {
-	Bin    string // path to claude CLI (default: "claude")
-	Model  string // model override (optional)
-	Effort string // effort level: low|medium|high (optional)
+	Bin            string // path to claude CLI (default: "claude")
+	Model          string // model override (optional)
+	Effort         string // effort level: low|medium|high (optional)
+	requestedModel string // set by ApplyProfile
 }
 
 // NewClaudeCoordinator returns a Claude-backed coordinator.

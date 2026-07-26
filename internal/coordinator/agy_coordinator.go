@@ -13,9 +13,10 @@ import (
 //
 // Same contract as CodexCoordinator and ClaudeCoordinator.
 type AGYCoordinator struct {
-	Bin    string // path to agy CLI (default: "agy")
-	Model  string // model override (optional)
-	Effort string // effort level: low|medium|high (optional)
+	Bin            string // path to agy CLI (default: "agy")
+	Model          string // model override (optional)
+	Effort         string // effort level: low|medium|high (optional)
+	requestedModel string // set by ApplyProfile
 }
 
 // NewAGYCoordinator returns an AGY-backed coordinator.

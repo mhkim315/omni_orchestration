@@ -12,8 +12,9 @@ import (
 // It implements Coordinator by calling `codex exec --json` with a
 // structured prompt and parsing the JSON response.
 type CodexCoordinator struct {
-	Bin   string // path to codex CLI (default: "codex")
-	Model string // model override (optional)
+	Bin            string // path to codex CLI (default: "codex")
+	Model          string // model override (optional)
+	requestedModel string // set by ApplyProfile
 }
 
 // NewCodexCoordinator returns a Codex-backed coordinator.
