@@ -480,7 +480,8 @@ func verifyAttachIdentity(pid int) (AttachIdentity, error) {
 
 // watchAttached polls kill(pid,0) until the process exits.
 // Once dead, tries wait4 to capture the real exit code.
-// R10: Only CRASHED if wait4 confirms non-zero exit; default 0 when wait4 unavailable.
+// R11: ECHILD (not our child) → leave ExitCode = -1 (UNKNOWN).
+// Don't invent 0 success when we can't verify. Only EXITED when wait4 confirms code 0.
 func (r *Runtime) watchAttached(pid int) {
 	defer r.outputWg.Done()
 	defer close(r.output)
@@ -493,7 +494,7 @@ func (r *Runtime) watchAttached(pid int) {
 		case <-ticker.C:
 			if err := syscall.Kill(pid, 0); err != nil {
 				// Process died — try wait4 to get real exit code.
-				exitCode := 0
+				exitCode := -1 // R11: default UNKNOWN, not 0 success
 				var ws syscall.WaitStatus
 				wpid, wErr := syscall.Wait4(pid, &ws, syscall.WNOHANG, nil)
 				if wErr == nil && wpid == pid {
@@ -504,8 +505,9 @@ func (r *Runtime) watchAttached(pid int) {
 						exitCode = -1 // killed by signal
 					}
 				}
-				// If wait4 failed (ECHILD — not our child), exitCode stays 0.
-				// R10: only CRASHED when wait4 confirms non-zero. Default is clean exit.
+				// R11: If wait4 failed (ECHILD — not our child), exitCode stays -1.
+				// Supervisor will emit CRASHED for -1 (non-zero), which is correct:
+				// we can't verify clean exit for an observed process.
 				ev := ExitEvent{ExitedAt: time.Now(), ExitCode: exitCode}
 				r.doneOnce.Do(func() { r.exitVal = ev; close(r.done) })
 				r.mu.Lock()
