@@ -347,6 +347,16 @@ func (r *Runtime) Generation() int64 {
 	return atomic.LoadInt64(&r.gen)
 }
 
+// PID returns the OS process ID of the child, or 0 if not started.
+func (r *Runtime) PID() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.cmd != nil && r.cmd.Process != nil {
+		return r.cmd.Process.Pid
+	}
+	return 0
+}
+
 // ── Internal ──
 
 func (r *Runtime) readOutput(ctx context.Context, rdr io.Reader) {

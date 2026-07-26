@@ -312,17 +312,19 @@ func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instructi
 		rc.wt.Remove(info.Path)
 		return nil, fmt.Errorf("create attempt: %w", err)
 	}
-	worker, err := rc.store.RecordWorker(attempt.ID, rc.cfg.Command, cwd, "primary", 1)
-	if err != nil {
-		rc.wt.Remove(info.Path)
-		return nil, fmt.Errorf("record worker: %w", err)
-	}
 
 	rt := runtime.New()
 	if err := rt.Start(rc.cfg.Command, cwd); err != nil {
-		rc.store.EmitEvent(rc.runID, taskID, attempt.ID, worker.ID, "start_failed", nil)
 		rc.wt.Remove(info.Path)
 		return nil, fmt.Errorf("start worker: %w", err)
+	}
+
+	// Record worker AFTER Start to capture real PID.
+	worker, err := rc.store.RecordWorkerPID(attempt.ID, rc.cfg.Command, cwd, "primary", 1, rt.PID(), 0)
+	if err != nil {
+		rt.Close(context.Background(), rt.Generation())
+		rc.wt.Remove(info.Path)
+		return nil, fmt.Errorf("record worker: %w", err)
 	}
 
 	// B-R1: Write coordinator instruction to worker stdin.

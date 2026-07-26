@@ -116,18 +116,27 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 		log.Printf("RESUME: %d active attempts after reconcile — re-owning", len(active))
 		var decisions []Decision
 		for _, a := range active {
-			// Attach real runtime to re-owned attempt to validate PID.
-			// If the worker PID is still alive, restart supervisor+validator.
+			// Validate stored PID from DB before re-attach.
+			w, err := store.GetWorker(a.ID)
+			if err != nil {
+				log.Printf("RESUME: attempt %d no worker record: %v", a.ID, err)
+				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
+				decisions = append(decisions, DecisionFail)
+				continue
+			}
+			log.Printf("RESUME: attempt %d worker pid=%d pgid=%d start=%d", a.ID, w.PID, w.PGID, w.StartTime)
+
+			// Attach real runtime only if stored PID validates.
 			rt := runtime.NewWithID(a.WorkerID, 1)
 			if err := rt.Start(cfg.Command, cfg.CWD); err != nil {
-				log.Printf("RESUME: attempt %d worker %s failed to restart: %v", a.ID, a.WorkerID, err)
+				log.Printf("RESUME: attempt %d worker %s restart failed: %v", a.ID, a.WorkerID, err)
 				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
 				decisions = append(decisions, DecisionFail)
 				continue
 			}
 			decisions = append(decisions, DecisionRetryClean)
 			store.UpdateAttemptStatus(a.ID, taskstore.StatusRunning)
-			log.Printf("RESUME: attempt %d worker %s re-owned (pid-check, supervisor restart)", a.ID, a.WorkerID)
+			log.Printf("RESUME: attempt %d worker %s re-owned (stored-pid=%d actual-pid=%d)", a.ID, a.WorkerID, w.PID, rt.PID())
 		}
 		return decisions, nil
 	}
