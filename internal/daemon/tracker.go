@@ -185,7 +185,8 @@ func (t *Tracker) executeTask(ctx context.Context, task *dag.Task) {
 			delete(t.active, task.ID)
 			cancel()
 			t.mu.Unlock()
-			t.paths.Release(task.ID)
+			// v3.0.2: Release persistent path leases on completion.
+			t.dagStore.ReleasePathLeases(task.ID)
 		}()
 
 		run, _ := t.store.CreateRun()

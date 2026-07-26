@@ -359,10 +359,12 @@ func (s *Store) GetTasksByRun(runID int64) ([]*Task, error) {
 func (s *Store) UnblockDependents(completedTaskID int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// v3.0.2: Unblock children via task_dependencies where this task is a parent.
+	// For multi-parent fan-in, call UnblockIfReady to check ALL parents.
 	res, err := s.db.Exec(
-		`UPDATE dag_tasks SET status=? WHERE id IN
-		 (SELECT task_id FROM task_dependencies WHERE depends_on_task_id=?)
-		 AND status=?`,
+		`UPDATE dag_tasks SET status=? WHERE id IN (
+			SELECT task_id FROM task_dependencies WHERE depends_on_task_id=?
+		) AND status=?`,
 		StatusPending, completedTaskID, StatusBlocked,
 	)
 	if err != nil {
