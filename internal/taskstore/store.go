@@ -214,6 +214,8 @@ func (s *Store) migrate() error {
 	if err != nil {
 		return err
 	}
+	// R5: UNIQUE INDEX on run_records.run_id for dedup.
+	s.db.Exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_run_records_run_id ON run_records(run_id)")
 	// Migration: add pid/pgid/start_time_ms. Ignore "duplicate column" errors.
 	for _, col := range []string{"pid", "pgid", "start_time_ms"} {
 		if _, err := s.db.Exec("ALTER TABLE workers ADD COLUMN " + col + " INTEGER NOT NULL DEFAULT 0"); err != nil {

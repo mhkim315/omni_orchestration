@@ -131,7 +131,16 @@ func run() error {
 	if len(decisions) > 0 {
 		log.Printf("decisions: %v", decisions)
 	}
-	return err
+	// R5: exit 1 when task failed or errored.
+	if err != nil {
+		return err
+	}
+	for _, d := range decisions {
+		if d == orchestrator.DecisionFail {
+			return fmt.Errorf("task failed (decision: FAIL)")
+		}
+	}
+	return nil
 }
 
 func recoverCmd() error {
@@ -272,10 +281,10 @@ func resultShow(store *taskstore.Store, target string) error {
 	fmt.Printf("Task: %s\n", task.Title)
 	if rec != nil {
 		fmt.Printf("Provider: %s  Model: %s  Role: %s\n", rec.Provider, rec.Model, rec.Role)
-		fmt.Printf("Duration: %dms  Atattempts: %d  Rejects: %d  Adopted: %d\n",
+		fmt.Printf("Duration: %dms  Attempts: %d  Rejects: %d  Adopted: %d\n",
 			rec.DurationMs, rec.AttemptCount, rec.ValidatorRejectCount, rec.FinalAdoptedAttempt)
 	}
-	fmt.Printf("\nAtattempts:\n")
+	fmt.Printf("\nAttempts:\n")
 	for _, a := range attempts {
 		adopted := ""
 		if rec != nil && rec.FinalAdoptedAttempt == a.Number {
