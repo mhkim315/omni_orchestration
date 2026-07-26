@@ -171,3 +171,43 @@ func TestRestartResume(t *testing.T) {
 
 var _ = fmt.Sprintf
 var _ = os.TempDir
+
+// 6. Multi-repo: per-task repo override, cross-repo dependency, partial failure
+func TestMultiRepoCrossRepoPartialFailure(t *testing.T) {
+	s, _ := NewInMemory()
+	defer s.Close()
+
+	// Task A in repo-1.
+	a, _ := s.CreateTaskWithRepo(1, "repo-1 task", 0, "/repos/repo-1")
+	// Task B in repo-2, depends on A (cross-repo).
+	b, _ := s.CreateTaskWithRepo(1, "repo-2 task", a.ID, "/repos/repo-2")
+	// Task C in repo-1, no dependency.
+	c, _ := s.CreateTaskWithRepo(1, "repo-1 task 2", 0, "/repos/repo-1")
+
+	if a.Repo != "/repos/repo-1" {
+		t.Errorf("A repo = %s, want /repos/repo-1", a.Repo)
+	}
+	if b.Repo != "/repos/repo-2" {
+		t.Errorf("B repo = %s, want /repos/repo-2", b.Repo)
+	}
+	if b.DependsOnTaskID != a.ID {
+		t.Errorf("B depends_on = %d, want %d", b.DependsOnTaskID, a.ID)
+	}
+
+	// Partial failure: fail A → B stays blocked.
+	s.UpdateTaskStatus(a.ID, StatusFailed)
+	bAfter, _ := s.GetTask(b.ID)
+	if bAfter.Status != StatusBlocked {
+		t.Errorf("B status after A failed = %s, want blocked (cross-repo partial failure)", bAfter.Status)
+	}
+
+	// C (independent, same repo as A) completes fine.
+	s.UpdateTaskStatus(c.ID, StatusCompleted)
+	cAfter, _ := s.GetTask(c.ID)
+	if cAfter.Status != StatusCompleted {
+		t.Errorf("C status = %s, want completed (independent task)", cAfter.Status)
+	}
+
+	t.Logf("multi-repo: A=%s B=%s C=%s (partial failure: A failed blocks B, C independent)",
+		a.Repo, b.Repo, c.Repo)
+}

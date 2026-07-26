@@ -41,6 +41,7 @@ type Task struct {
 	Title           string    `json:"title"`
 	Status          string    `json:"status"`
 	DependsOnTaskID int64     `json:"depends_on_task_id,omitempty"`
+	Repo            string    `json:"repo,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
 }
 
@@ -161,8 +162,14 @@ func (s *Store) migrate() error {
 		path TEXT NOT NULL UNIQUE
 	);
 	`
-	_, err := s.db.Exec(ddl)
-	return err
+	if _, err := s.db.Exec(ddl); err != nil {
+		return err
+	}
+	// v3.0: repo column for multi-repo fleet.
+	for _, col := range []string{"repo"} {
+		s.db.Exec("ALTER TABLE dag_tasks ADD COLUMN " + col + " TEXT NOT NULL DEFAULT ''")
+	}
+	return nil
 }
 
 // ── API ──
@@ -170,6 +177,11 @@ func (s *Store) migrate() error {
 // CreateTask adds a task to the DAG. If dependsOn > 0, the task starts as blocked
 // and a circular dependency check is performed.
 func (s *Store) CreateTask(runID int64, title string, dependsOn int64) (*Task, error) {
+	return s.CreateTaskWithRepo(runID, title, dependsOn, "")
+}
+
+// CreateTaskWithRepo creates a task with a per-task repo override.
+func (s *Store) CreateTaskWithRepo(runID int64, title string, dependsOn int64, repo string) (*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -187,8 +199,8 @@ func (s *Store) CreateTask(runID int64, title string, dependsOn int64) (*Task, e
 	}
 
 	res, err := s.db.Exec(
-		"INSERT INTO dag_tasks (run_id, title, status, depends_on_task_id) VALUES (?,?,?,?)",
-		runID, title, status, dependsOn,
+		"INSERT INTO dag_tasks (run_id, title, status, depends_on_task_id, repo) VALUES (?,?,?,?,?)",
+		runID, title, status, dependsOn, repo,
 	)
 	if err == nil && dependsOn > 0 {
 		id, _ := res.LastInsertId()
@@ -213,9 +225,9 @@ func (s *Store) getTask(id int64) (*Task, error) {
 	var createdAt string
 	var dependsOn sql.NullInt64
 	err := s.db.QueryRow(
-		"SELECT id, run_id, title, status, depends_on_task_id, created_at FROM dag_tasks WHERE id=?",
+		"SELECT id, run_id, title, status, depends_on_task_id, repo, created_at FROM dag_tasks WHERE id=?",
 		id,
-	).Scan(&t.ID, &t.RunID, &t.Title, &t.Status, &dependsOn, &createdAt)
+	).Scan(&t.ID, &t.RunID, &t.Title, &t.Status, &dependsOn, &t.Repo, &createdAt)
 	if err != nil {
 		return nil, err
 	}
@@ -323,21 +335,21 @@ func (s *Store) UpdateTaskStatus(id int64, status string) error {
 func (s *Store) GetBlockedTasks() ([]*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, created_at FROM dag_tasks WHERE status=?", StatusBlocked)
+	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, repo, created_at FROM dag_tasks WHERE status=?", StatusBlocked)
 }
 
 // GetReadyTasks returns pending tasks (ready to execute).
 func (s *Store) GetReadyTasks() ([]*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, created_at FROM dag_tasks WHERE status=?", StatusPending)
+	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, repo, created_at FROM dag_tasks WHERE status=?", StatusPending)
 }
 
 // GetTasksByRun returns all tasks for a run.
 func (s *Store) GetTasksByRun(runID int64) ([]*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, created_at FROM dag_tasks WHERE run_id=? ORDER BY id", runID)
+	return s.queryTasks("SELECT id, run_id, title, status, depends_on_task_id, repo, created_at FROM dag_tasks WHERE run_id=? ORDER BY id", runID)
 }
 
 // UnblockDependents finds all tasks blocked on the given task and unblocks them.
@@ -411,7 +423,7 @@ func (s *Store) queryTasks(query string, args ...interface{}) ([]*Task, error) {
 		t := &Task{}
 		var createdAt string
 		var dependsOn sql.NullInt64
-		if err := rows.Scan(&t.ID, &t.RunID, &t.Title, &t.Status, &dependsOn, &createdAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.RunID, &t.Title, &t.Status, &dependsOn, &t.Repo, &createdAt); err != nil {
 			return nil, err
 		}
 		if dependsOn.Valid {
