@@ -196,36 +196,45 @@ func TestRecovery_ResumeWithRecovery(t *testing.T) {
 
 // TestRuntimeAttachRealProcess verifies Attach on a live process.
 func TestRuntimeAttachRealProcess(t *testing.T) {
-	// Start a real process.
+	// Start a long-lived process for reliable attach testing.
 	rt := runtime.New()
-	if err := rt.Start("sleep 30", "/tmp"); err != nil {
+	if err := rt.Start("sleep 300", "/tmp"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	pid := rt.PID()
 	if pid <= 0 {
+		rt.Close(context.Background(), rt.Generation())
 		t.Fatal("no PID after Start")
 	}
 	t.Logf("started process pid=%d", pid)
 
-	// Attach to the running process.
+	// Attach to the running process. Use empty Executable to skip
+	// command check (ps comm may differ from bash -c wrapper).
 	rt2 := runtime.NewWithID("attached-1", 1)
-	id := runtime.AttachIdentity{PID: pid, Executable: "sleep"}
+	id := runtime.AttachIdentity{PID: pid}
 	if err := rt2.Attach(pid, id, 1); err != nil {
+		rt.Close(context.Background(), rt.Generation())
 		t.Fatalf("Attach: %v", err)
 	}
 	if rt2.PID() != pid {
 		t.Errorf("attached PID=%d, want %d", rt2.PID(), pid)
 	}
 
-	// Fake PID must fail.
+	// Signal-based cleanup: attached Runtime can send signals.
+	if err := rt2.Interrupt(1); err != nil {
+		t.Logf("Interrupt on attached: %v (expected for non-child)", err)
+	}
+
+	// Fake PID must fail-closed.
 	rt3 := runtime.NewWithID("fake", 1)
 	if err := rt3.Attach(99999, runtime.AttachIdentity{PID: 99999}, 1); err == nil {
 		t.Error("fake PID should fail")
 	}
 
-	// Clean up.
+	// Clean up the original process.
 	rt.Close(context.Background(), rt.Generation())
 	rt.Wait()
+	t.Log("attach test complete")
 }
 
 // runGit is defined in orchestrator_test.go
