@@ -109,8 +109,12 @@ func (c *CoordinatorRuntime) Wake(ctx context.Context, generation int64, pkt Wak
 	snapshotGen := generation // capture at call time
 	_ = seq
 
-	// Call the coordinator with timeout.
-	timeoutCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	// Call the coordinator with timeout. Read under lock to avoid
+	// data race with SetTimeout.
+	c.mu.Lock()
+	t := c.timeout
+	c.mu.Unlock()
+	timeoutCtx, cancel := context.WithTimeout(ctx, t)
 	defer cancel()
 
 	result, err := c.coordinator.Decide(timeoutCtx, state)
