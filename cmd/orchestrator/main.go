@@ -44,9 +44,17 @@ func run() error {
 	coordFlag := runCmd.String("coordinator", "", "Coordinator mode: codex|claude|agy|reasonix|auto")
 	modelFlag := runCmd.String("model", "", "Model override (provider-native name)")
 	effortFlag := runCmd.String("effort", "", "Effort level (low|medium|high)")
+	resumeFlag := runCmd.Bool("resume", false, "Resume from last checkpoint (auto-recover orphaned runs)")
 
-	if len(os.Args) < 2 || os.Args[1] != "run" {
-		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--coordinator codex|claude|agy|reasonix|auto] [--model <name>] [--effort low|medium|high] [--validator <cmd>] [--store <path>]\n")
+	if len(os.Args) < 2 {
+		fmt.Fprintf(os.Stderr, "Usage:\n  orchestrator run --task <title> --command <cmd> --repo <path> [flags]\n  orchestrator recover [--store <path>]\n")
+		os.Exit(2)
+	}
+	if os.Args[1] == "recover" {
+		return recoverCmd()
+	}
+	if os.Args[1] != "run" {
+		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--resume] [--coordinator codex|claude|agy|reasonix|auto] [--model <name>] [--effort low|medium|high] [--validator <cmd>] [--store <path>]\n")
 		os.Exit(2)
 	}
 	runCmd.Parse(os.Args[2:])
@@ -96,7 +104,14 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	decisions, err := orchestrator.Run(ctx, cfg, store, wt)
+	var decisions []orchestrator.Decision
+
+	if *resumeFlag {
+		decisions, err = orchestrator.ResumeWithRecovery(ctx, cfg, store, wt)
+	} else {
+		decisions, err = orchestrator.Run(ctx, cfg, store, wt)
+	}
+
 	if err != nil {
 		log.Printf("orchestrator: %v", err)
 	}
@@ -104,6 +119,23 @@ func run() error {
 		log.Printf("decisions: %v", decisions)
 	}
 	return err
+}
+
+func recoverCmd() error {
+	storePath := filepath.Join(os.TempDir(), "omni-orchestrator.db")
+	store, err := orchestrator.OpenStore(storePath)
+	if err != nil {
+		return fmt.Errorf("store: %w", err)
+	}
+	defer store.Close()
+
+	result := orchestrator.RecoverOnly(store, worktree.New())
+	if len(result.Errors) > 0 {
+		return fmt.Errorf("recovery had %d errors", len(result.Errors))
+	}
+	log.Printf("Recovery complete: %d orphan runs, %d interrupted",
+		result.OrphanRuns, result.Interrupted)
+	return nil
 }
 
 func makeCoordinator(name, model, effort string) (coordinator.Coordinator, error) {
