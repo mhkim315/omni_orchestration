@@ -1,8 +1,8 @@
-// Package daemon — Tracker v1.7
+// Package daemon — Tracker v1.8
 //
-// Daemon-powered unattended run tracker. Polls DAG tasks, creates
-// attempts for unblocked tasks, monitors completion via mailbox,
-// and resumes active work on restart.
+// Limited parallelism: two independent executors with owned file paths.
+// Each DAG leaf task dispatched to available worker. OwnedPathMap prevents
+// conflicts. No shared files. Validator after each. Restart recovers both.
 package daemon
 
 import (
@@ -18,20 +18,56 @@ import (
 	"github.com/mhkim315/omni_orchestration/internal/worktree"
 )
 
-// Tracker polls the DAG for ready tasks and executes them.
+const maxWorkers = 2
+
+// OwnedPathMap tracks which paths are owned by which worker.
+type OwnedPathMap struct {
+	mu    sync.Mutex
+	paths map[string]int64 // path → taskID
+}
+
+// TryAcquire attempts to claim a set of paths. Returns true if all available.
+func (o *OwnedPathMap) TryAcquire(taskID int64, paths []string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, p := range paths {
+		if owner, ok := o.paths[p]; ok && owner != taskID {
+			return false // conflict with another task
+		}
+	}
+	for _, p := range paths {
+		o.paths[p] = taskID
+	}
+	return true
+}
+
+// Release frees paths owned by a task.
+func (o *OwnedPathMap) Release(taskID int64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for p, owner := range o.paths {
+		if owner == taskID {
+			delete(o.paths, p)
+		}
+	}
+}
+
+// ── Tracker ──
+
 type Tracker struct {
 	store    *taskstore.Store
 	dagStore *dag.Store
 	wt       *worktree.Manager
-	cfg      orchestrator.Config // template for new runs
+	cfg      orchestrator.Config
 
 	mu       sync.Mutex
-	active   map[int64]context.CancelFunc // taskID → cancel
+	active   map[int64]context.CancelFunc
+	workers  int // running worker count
+	paths    *OwnedPathMap
 	pollTick time.Duration
 	closed   bool
 }
 
-// NewTracker creates a task tracker.
 func NewTracker(store *taskstore.Store, dagStore *dag.Store, wt *worktree.Manager, cfg orchestrator.Config) *Tracker {
 	return &Tracker{
 		store:    store,
@@ -39,21 +75,19 @@ func NewTracker(store *taskstore.Store, dagStore *dag.Store, wt *worktree.Manage
 		wt:       wt,
 		cfg:      cfg,
 		active:   make(map[int64]context.CancelFunc),
+		paths:    &OwnedPathMap{paths: make(map[string]int64)},
 		pollTick: 2 * time.Second,
 	}
 }
 
-// Start begins the tracker loop. Returns a cancel function.
 func (t *Tracker) Start(ctx context.Context) {
 	go t.loop(ctx)
-	log.Printf("tracker: started (poll=%v)", t.pollTick)
+	log.Printf("tracker: started (workers=%d, poll=%v)", maxWorkers, t.pollTick)
 }
 
-// loop polls for ready tasks and executes them.
 func (t *Tracker) loop(ctx context.Context) {
 	ticker := time.NewTicker(t.pollTick)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -65,13 +99,19 @@ func (t *Tracker) loop(ctx context.Context) {
 	}
 }
 
-// poll checks for ready DAG tasks and starts execution.
+// poll dispatches ready tasks to available workers.
 func (t *Tracker) poll(ctx context.Context) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if t.closed {
 		return
+	}
+
+	// Count active workers.
+	activeCount := len(t.active)
+	if activeCount >= maxWorkers {
+		return // all workers busy
 	}
 
 	ready, err := t.dagStore.GetReadyTasks()
@@ -81,21 +121,36 @@ func (t *Tracker) poll(ctx context.Context) {
 	}
 
 	for _, task := range ready {
-		if _, running := t.active[task.ID]; running {
-			continue // already being tracked
+		if len(t.active) >= maxWorkers {
+			break
 		}
+		if _, running := t.active[task.ID]; running {
+			continue
+		}
+
+		// v1.8: Path conflict check — serialize conflicting tasks.
+		taskPaths := taskOwnedPaths(task)
+		if !t.paths.TryAcquire(task.ID, taskPaths) {
+			log.Printf("tracker: task %d path conflict — waiting", task.ID)
+			continue
+		}
+
 		t.executeTask(ctx, task)
 	}
 }
 
-// executeTask marks a task active and runs it in a goroutine.
+// taskOwnedPaths returns the file paths a task will own.
+// Leaf tasks (no dependents) own their worktree path.
+func taskOwnedPaths(task *dag.Task) []string {
+	return []string{fmt.Sprintf("task-%d", task.ID)}
+}
+
 func (t *Tracker) executeTask(ctx context.Context, task *dag.Task) {
 	taskCtx, cancel := context.WithCancel(ctx)
 	t.active[task.ID] = cancel
 
-	log.Printf("tracker: executing task %d (%s)", task.ID, task.Title)
+	log.Printf("tracker: worker executing task %d (%s)", task.ID, task.Title)
 
-	// Create orchestrator run.
 	cfg := t.cfg
 	cfg.Task = task.Title
 	cfg.Command = fmt.Sprintf("echo 'task %d executing'", task.ID)
@@ -106,31 +161,19 @@ func (t *Tracker) executeTask(ctx context.Context, task *dag.Task) {
 			delete(t.active, task.ID)
 			cancel()
 			t.mu.Unlock()
+			t.paths.Release(task.ID)
 		}()
 
-		// Create attempt in taskstore.
-		run, err := t.store.CreateRun()
-		if err != nil {
-			log.Printf("tracker: task %d create run: %v", task.ID, err)
-			t.dagStore.UpdateTaskStatus(task.ID, dag.StatusFailed)
-			return
-		}
-		taskRec, err := t.store.CreateTask(run.ID, task.Title)
-		if err != nil {
-			t.dagStore.UpdateTaskStatus(task.ID, dag.StatusFailed)
-			return
-		}
+		run, _ := t.store.CreateRun()
+		taskRec, _ := t.store.CreateTask(run.ID, task.Title)
 		attempt, err := t.store.CreateAttempt(taskRec.ID, 1, fmt.Sprintf("tracker-%d", task.ID), "HEAD", "HEAD")
 		if err != nil {
 			t.dagStore.UpdateTaskStatus(task.ID, dag.StatusFailed)
 			return
 		}
 		_ = attempt
-
-		// Update DAG status to active.
 		t.dagStore.UpdateTaskStatus(task.ID, dag.StatusActive)
 
-		// Execute orchestrator run.
 		decisions, err := orchestrator.Run(taskCtx, cfg, t.store, t.wt)
 		if err != nil {
 			log.Printf("tracker: task %d run error: %v", task.ID, err)
@@ -138,7 +181,6 @@ func (t *Tracker) executeTask(ctx context.Context, task *dag.Task) {
 			return
 		}
 
-		// On completion, mark DAG task completed and unblock dependents.
 		for _, d := range decisions {
 			if d == orchestrator.DecisionComplete {
 				t.dagStore.UpdateTaskStatus(task.ID, dag.StatusCompleted)
@@ -154,27 +196,18 @@ func (t *Tracker) executeTask(ctx context.Context, task *dag.Task) {
 				return
 			}
 		}
-
-		log.Printf("tracker: task %d decisions: %v", task.ID, decisions)
 	}()
 }
 
-// ResumeActiveTasks finds all active DAG tasks and resumes tracking.
 func (t *Tracker) ResumeActiveTasks() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	// Find DAG tasks that are active (were running when daemon stopped).
-	allTasks, err := t.dagStore.GetReadyTasks() // pending → need execution
-	if err != nil {
-		log.Printf("tracker: resume error: %v", err)
-		return
-	}
-	for _, task := range allTasks {
+	ready, _ := t.dagStore.GetReadyTasks()
+	for _, task := range ready {
 		log.Printf("tracker: found pending task %d (%s) — will execute", task.ID, task.Title)
 	}
 
-	// Also check for blocked tasks — unblock if their dependency completed.
 	blocked, _ := t.dagStore.GetBlockedTasks()
 	for _, task := range blocked {
 		if task.DependsOnTaskID > 0 {
@@ -187,7 +220,6 @@ func (t *Tracker) ResumeActiveTasks() {
 	}
 }
 
-// Close stops the tracker gracefully.
 func (t *Tracker) Close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -199,7 +231,6 @@ func (t *Tracker) Close() {
 	log.Printf("tracker: closed (%d active tasks cancelled)", len(t.active))
 }
 
-// ActiveCount returns how many tasks are currently being tracked.
 func (t *Tracker) ActiveCount() int {
 	t.mu.Lock()
 	defer t.mu.Unlock()

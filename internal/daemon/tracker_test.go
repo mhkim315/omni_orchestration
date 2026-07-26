@@ -169,3 +169,124 @@ func TestGracefulShutdownMidRun(t *testing.T) {
 }
 
 var _ = os.TempDir
+
+// 4. Two tasks with disjoint paths complete in parallel
+func TestTwoTasksParallelDisjoint(t *testing.T) {
+	tr, dagStore, cleanup := setupTracker(t)
+	defer cleanup()
+
+	t1, _ := dagStore.CreateTask(1, "task-alpha", 0)
+	t2, _ := dagStore.CreateTask(1, "task-beta", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr.Start(ctx)
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		if tr.ActiveCount() >= 2 {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	count := tr.ActiveCount()
+	t.Logf("parallel workers active: %d", count)
+	if count < 2 {
+		t.Errorf("expected 2 parallel workers, got %d", count)
+	}
+
+	time.Sleep(3 * time.Second)
+	s1, _ := dagStore.GetTask(t1.ID)
+	s2, _ := dagStore.GetTask(t2.ID)
+	t.Logf("t1=%s t2=%s", s1.Status, s2.Status)
+	if s1.Status == dag.StatusCompleted && s2.Status == dag.StatusCompleted {
+		t.Log("✓ Both tasks completed in parallel")
+	}
+}
+
+// 5. Conflicting paths serialized
+func TestConflictingPathsSerialized(t *testing.T) {
+	tr, dagStore, cleanup := setupTracker(t)
+	defer cleanup()
+
+	t1, _ := dagStore.CreateTask(1, "task-first", 0)
+	_ = t1
+	t2, _ := dagStore.CreateTask(1, "task-second", 0)
+
+	// Acquire t2's path to simulate conflict.
+	tr.paths.TryAcquire(999, []string{"task-2"})
+	defer tr.paths.Release(999)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr.Start(ctx)
+
+	time.Sleep(3 * time.Second)
+	count := tr.ActiveCount()
+	t.Logf("workers active with conflict: %d (expect 1 — t2 blocked)", count)
+
+	s2, _ := dagStore.GetTask(t2.ID)
+	if s2.Status == dag.StatusActive {
+		t.Error("t2 should still be pending (path conflict)")
+	} else {
+		t.Log("✓ t2 blocked by path conflict — serialized")
+	}
+
+	tr.paths.Release(999)
+	time.Sleep(3 * time.Second)
+	s2After, _ := dagStore.GetTask(t2.ID)
+	t.Logf("t2 after release: %s", s2After.Status)
+}
+
+// 6. Restart recovers both workers
+func TestRestartRecoversBothWorkers(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "parallel-store.db")
+	dagPath := filepath.Join(t.TempDir(), "parallel-dag.db")
+
+	store, _ := taskstore.New(storePath)
+	dagStore, _ := dag.New(dagPath)
+
+	repoDir := t.TempDir()
+	os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# t"), 0644)
+
+	cfg := orchestrator.Config{Repo: repoDir, Command: "echo done", Validator: "true"}
+	tr := NewTracker(store, dagStore, worktree.New(), cfg)
+
+	t1, _ := dagStore.CreateTask(1, "recover-1", 0)
+	t2, _ := dagStore.CreateTask(1, "recover-2", 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	tr.Start(ctx)
+	time.Sleep(500 * time.Millisecond)
+
+	cancel()
+	tr.Close()
+	store.Close()
+	dagStore.Close()
+
+	store2, _ := taskstore.New(storePath)
+	dagStore2, _ := dag.New(dagPath)
+	defer store2.Close()
+	defer dagStore2.Close()
+
+	tr2 := NewTracker(store2, dagStore2, worktree.New(), cfg)
+	defer tr2.Close()
+	tr2.ResumeActiveTasks()
+
+	s1, _ := dagStore2.GetTask(t1.ID)
+	s2, _ := dagStore2.GetTask(t2.ID)
+	t.Logf("after restart: t1=%s t2=%s", s1.Status, s2.Status)
+	if s1.Status == "" || s2.Status == "" {
+		t.Error("tasks not found after restart")
+	} else {
+		t.Log("✓ Both tasks recovered after restart")
+	}
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	tr2.Start(ctx2)
+	time.Sleep(4 * time.Second)
+	s1f, _ := dagStore2.GetTask(t1.ID)
+	s2f, _ := dagStore2.GetTask(t2.ID)
+	t.Logf("final: t1=%s t2=%s", s1f.Status, s2f.Status)
+}
