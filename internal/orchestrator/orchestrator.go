@@ -181,8 +181,7 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 	}
 	rc.decisions = append(rc.decisions, startResp.Decision)
 	if startResp.Decision == DecisionFail {
-		store.UpdateRunStatus(run.ID, taskstore.StatusFailed)
-		store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
+		rc.finalizeTerminal(nil, taskstore.StatusFailed)
 		return rc.decisions, nil
 	}
 
@@ -197,6 +196,7 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 	for {
 		select {
 		case <-ctx.Done():
+			rc.finalizeTerminal(nil, taskstore.StatusCancelled)
 			return rc.decisions, ctx.Err()
 		default:
 		}
@@ -205,8 +205,7 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		if startResp.Decision == DecisionValidate && rc.cfg.Coordinator == nil {
 			autoValidateCount++
 			if autoValidateCount > maxAutoValidate {
-				store.UpdateRunStatus(run.ID, taskstore.StatusFailed)
-				store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
+				rc.finalizeTerminal(nil, taskstore.StatusFailed)
 				log.Printf("C2: max auto-VALIDATE (%d) exceeded", maxAutoValidate)
 				return rc.decisions, nil
 			}
@@ -215,14 +214,14 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		}
 
 		if attemptNum > maxAtts {
-			store.UpdateRunStatus(run.ID, taskstore.StatusFailed)
-			store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
-			log.Printf("B-R1: max attempts (%d) exceeded → FAIL", maxAtts)
+			rc.finalizeTerminal(nil, taskstore.StatusFailed)
+			log.Printf("B-R1: max attempts (%d) exceeded", maxAtts)
 			return rc.decisions, nil
 		}
 
 		ast, err := rc.createAttempt(task.ID, attemptNum, baseCommit, nextInstruction)
 		if err != nil {
+			rc.finalizeTerminal(nil, taskstore.StatusFailed)
 			return rc.decisions, err
 		}
 
@@ -248,14 +247,11 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		rc.decisions = append(rc.decisions, resp.Decision)
 
 		if resp.Decision == DecisionComplete {
-			store.UpdateRunStatus(run.ID, taskstore.StatusCompleted)
-			store.UpdateTaskStatus(task.ID, taskstore.StatusCompleted)
-			store.UpdateWorkerStatus(ast.worker.ID, taskstore.StatusCompleted)
+			rc.finalizeTerminal(ast, taskstore.StatusCompleted)
 			return rc.decisions, nil
 		}
 		if resp.Decision == DecisionFail {
-			store.UpdateRunStatus(run.ID, taskstore.StatusFailed)
-			store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
+			rc.finalizeTerminal(ast, taskstore.StatusFailed)
 			return rc.decisions, nil
 		}
 
@@ -453,6 +449,25 @@ func (rc *runContext) allowedDecisions(result observeResult) []string {
 	default:
 		return []string{"CONTINUE", "RETRY_CLEAN", "FAIL"}
 	}
+}
+
+// finalizeTerminal updates ALL status fields for a terminal run outcome.
+// Call this at every terminal return path (FAIL, COMPLETE, max-attempts,
+// max-auto-validate, ctx cancel, createAttempt error).
+func (rc *runContext) finalizeTerminal(ast *attemptState, status string) {
+	if ast != nil {
+		if ast.rt != nil {
+			ast.rt.Close(context.Background(), ast.rt.Generation())
+		}
+		if ast.attempt != nil {
+			rc.store.UpdateAttemptStatus(ast.attempt.ID, status)
+		}
+		if ast.worker != nil {
+			rc.store.UpdateWorkerStatus(ast.worker.ID, status)
+		}
+	}
+	rc.store.UpdateRunStatus(rc.runID, status)
+	rc.store.UpdateTaskStatus(rc.taskID, status)
 }
 
 // runValidatorBinary executes an external validator command.
