@@ -240,6 +240,24 @@ func (s *Store) UpdateTaskStatus(id int64, status string) error {
 	return err
 }
 
+// GetTasksByRun returns all tasks for a run.
+func (s *Store) GetTasksByRun(runID int64) ([]*Task, error) {
+	rows, err := s.db.Query("SELECT id, run_id, title, status FROM tasks WHERE run_id=?", runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Task
+	for rows.Next() {
+		t := &Task{}
+		if err := rows.Scan(&t.ID, &t.RunID, &t.Title, &t.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) GetTask(id int64) (*Task, error) {
 	t := &Task{}
 	err := s.db.QueryRow("SELECT id, run_id, title, status FROM tasks WHERE id=?", id).
@@ -296,6 +314,58 @@ func (s *Store) GetActiveAttempts() ([]*Attempt, error) {
 	}
 	return out, rows.Err()
 }
+
+// ── Result queries ──
+
+// GetAttemptsByTask returns all attempts for a task.
+func (s *Store) GetAttemptsByTask(taskID int64) ([]*Attempt, error) {
+	rows, err := s.db.Query(
+		"SELECT id, task_id, number, worker_id, branch, base_commit, checkpoint_commit, status FROM attempts WHERE task_id=? ORDER BY number",
+		taskID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []*Attempt
+	for rows.Next() {
+		a := &Attempt{}
+		if err := rows.Scan(&a.ID, &a.TaskID, &a.Number, &a.WorkerID, &a.Branch, &a.BaseCommit, &a.CheckpointCommit, &a.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// GetAttempt returns a single attempt by ID.
+func (s *Store) GetAttempt(id int64) (*Attempt, error) {
+	a := &Attempt{}
+	err := s.db.QueryRow(
+		"SELECT id, task_id, number, worker_id, branch, base_commit, checkpoint_commit, status FROM attempts WHERE id=?",
+		id,
+	).Scan(&a.ID, &a.TaskID, &a.Number, &a.WorkerID, &a.Branch, &a.BaseCommit, &a.CheckpointCommit, &a.Status)
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// GetRunRecord returns the run_records row for a run.
+func (s *Store) GetRunRecord(runID int64) (*RunRecord, error) {
+	r := &RunRecord{}
+	err := s.db.QueryRow(
+		"SELECT id, run_id, provider, model, role, task_category, repo, attempt_count, validator_reject_count, replacement_count, duration_ms, final_adopted_attempt, created_at FROM run_records WHERE run_id=?",
+		runID,
+	).Scan(&r.ID, &r.RunID, &r.Provider, &r.Model, &r.Role, &r.TaskCategory, &r.Repo, &r.AttemptCount, &r.ValidatorRejectCount, &r.ReplacementCount, &r.DurationMs, &r.FinalAdoptedAttempt, &r.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// GetRun returns a run by ID.
+func (s *Store) GetRun(id int64) (*Run, error) { return s.getRun(id) }
 
 // ── Workers ──
 

@@ -23,6 +23,7 @@ import (
 	"github.com/miinanii/omni_orchestration/internal/coordinator"
 	"github.com/miinanii/omni_orchestration/internal/orchestrator"
 	"github.com/miinanii/omni_orchestration/internal/runtime"
+	"github.com/miinanii/omni_orchestration/internal/taskstore"
 	"github.com/miinanii/omni_orchestration/internal/worktree"
 )
 
@@ -52,6 +53,9 @@ func run() error {
 	}
 	if os.Args[1] == "recover" {
 		return recoverCmd()
+	}
+	if os.Args[1] == "result" {
+		return resultCmd(os.Args[2:])
 	}
 	if os.Args[1] != "run" {
 		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--resume] [--coordinator codex|claude|agy|reasonix|auto] [--model <name>] [--effort low|medium|high] [--validator <cmd>] [--store <path>]\n")
@@ -182,4 +186,176 @@ func makeCoordinator(name, model, effort string) (coordinator.Coordinator, error
 	default:
 		return nil, fmt.Errorf("unknown coordinator: %q", name)
 	}
+}
+
+// ── Result subcommand ──
+
+func resultCmd(args []string) error {
+	if len(args) < 2 {
+		fmt.Fprintf(os.Stderr, "Usage: orchestrator result <show|diff|adopt|reject> <id> [--store <path>]\n")
+		os.Exit(2)
+	}
+	action := args[0]
+	target := args[1]
+
+	storePath := filepath.Join(os.TempDir(), "omni-orchestrator.db")
+	for i := 2; i < len(args); i++ {
+		if args[i] == "--store" && i+1 < len(args) {
+			storePath = args[i+1]
+		}
+	}
+
+	store, err := orchestrator.OpenStore(storePath)
+	if err != nil {
+		return fmt.Errorf("store: %w", err)
+	}
+	defer store.Close()
+
+	switch action {
+	case "show":
+		return resultShow(store, target)
+	case "diff":
+		return resultDiff(store, target)
+	case "adopt":
+		return resultAdopt(store, target)
+	case "reject":
+		return resultReject(store, target)
+	default:
+		return fmt.Errorf("unknown result action: %s (valid: show, diff, adopt, reject)", action)
+	}
+}
+
+func resultShow(store *taskstore.Store, target string) error {
+	runID, err := parseID(target)
+	if err != nil {
+		return err
+	}
+
+	run, err := store.GetRun(runID)
+	if err != nil {
+		return fmt.Errorf("run not found: %w", err)
+	}
+
+	rec, _ := store.GetRunRecord(runID)
+
+	// Find the task for this run.
+	tasks, err := store.GetTasksByRun(runID)
+	if err != nil {
+		return err
+	}
+	if len(tasks) == 0 {
+		return fmt.Errorf("no tasks for run %d", runID)
+	}
+	task := tasks[0]
+
+	attempts, err := store.GetAttemptsByTask(task.ID)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Run #%d — Status: %s\n", run.ID, run.Status)
+	fmt.Printf("Task: %s\n", task.Title)
+	if rec != nil {
+		fmt.Printf("Provider: %s  Model: %s  Role: %s\n", rec.Provider, rec.Model, rec.Role)
+		fmt.Printf("Duration: %dms  Attempts: %d  Rejects: %d  Adopted: %d\n",
+			rec.DurationMs, rec.AttemptCount, rec.ValidatorRejectCount, rec.FinalAdoptedAttempt)
+	}
+	fmt.Printf("\nAttempts:\n")
+	for _, a := range attempts {
+		adopted := ""
+		if rec != nil && rec.FinalAdoptedAttempt == a.Number {
+			adopted = " ★ ADOPTED"
+		}
+		fmt.Printf("  #%d — %s — branch: %s — checkpoint: %s%s\n",
+			a.Number, a.Status, a.Branch, a.CheckpointCommit, adopted)
+	}
+	return nil
+}
+
+func resultDiff(store *taskstore.Store, target string) error {
+	runID, err := parseID(target)
+	if err != nil {
+		return err
+	}
+
+	rec, err := store.GetRunRecord(runID)
+	if err != nil {
+		return fmt.Errorf("run record not found: %w", err)
+	}
+
+	if rec.FinalAdoptedAttempt == 0 {
+		return fmt.Errorf("no adopted attempt for run %d — use 'result adopt <attemptID>' first", runID)
+	}
+
+	// Show git diff of the checkpoint commit vs base.
+	tasks, _ := store.GetTasksByRun(runID)
+	if len(tasks) == 0 {
+		return fmt.Errorf("no tasks")
+	}
+	attempts, _ := store.GetAttemptsByTask(tasks[0].ID)
+
+	for _, a := range attempts {
+		if a.Number == rec.FinalAdoptedAttempt && a.CheckpointCommit != "" {
+			cmd := exec.Command("git", "diff", a.BaseCommit, a.CheckpointCommit)
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			return cmd.Run()
+		}
+	}
+	return fmt.Errorf("adopted attempt has no checkpoint")
+}
+
+func resultAdopt(store *taskstore.Store, target string) error {
+	runID, err := parseID(target)
+	if err != nil {
+		return err
+	}
+
+	tasks, _ := store.GetTasksByRun(runID)
+	if len(tasks) == 0 {
+		return fmt.Errorf("no tasks")
+	}
+	attempts, _ := store.GetAttemptsByTask(tasks[0].ID)
+
+	if len(attempts) == 0 {
+		return fmt.Errorf("no attempts")
+	}
+	last := attempts[len(attempts)-1]
+
+	if err := store.RecordAdoption(runID, last.Number, true); err != nil {
+		return fmt.Errorf("adopt: %w", err)
+	}
+	fmt.Printf("Run #%d — Attempt #%d adopted ✓\n", runID, last.Number)
+	return nil
+}
+
+func resultReject(store *taskstore.Store, target string) error {
+	runID, err := parseID(target)
+	if err != nil {
+		return err
+	}
+
+	tasks, _ := store.GetTasksByRun(runID)
+	if len(tasks) == 0 {
+		return fmt.Errorf("no tasks")
+	}
+	attempts, _ := store.GetAttemptsByTask(tasks[0].ID)
+	if len(attempts) == 0 {
+		return fmt.Errorf("no attempts")
+	}
+	last := attempts[len(attempts)-1]
+
+	if err := store.UpdateAttemptStatus(last.ID, taskstore.StatusFailed); err != nil {
+		return fmt.Errorf("reject: %w", err)
+	}
+	fmt.Printf("Run #%d — Attempt #%d rejected ✗\n", runID, last.Number)
+	return nil
+}
+
+func parseID(s string) (int64, error) {
+	var id int64
+	if _, err := fmt.Sscanf(s, "%d", &id); err != nil || id <= 0 {
+		return 0, fmt.Errorf("invalid ID: %s", s)
+	}
+	return id, nil
 }
