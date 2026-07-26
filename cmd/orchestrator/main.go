@@ -88,7 +88,8 @@ func run() error {
 
 	if *coordFlag == "auto" {
 		// R2: SQLite-backed router using persisted stats.
-		router := coordinator.NewRouter(nil)
+		statsAdapter := orchestrator.NewStoreStatsAdapter(store)
+		router := coordinator.NewRouter(statsAdapter)
 		selected := router.SelectCoordinator(*task, *repo, *modelFlag, *effortFlag)
 		log.Printf("Router: selected %s for task %q (model=%s effort=%s)", selected, *task, *modelFlag, *effortFlag)
 		*coordFlag = string(selected)
@@ -105,6 +106,12 @@ func run() error {
 	}
 	if cfg.Coordinator == nil {
 		log.Printf("Coordinator: auto-VALIDATE (no --coordinator flag)")
+	}
+
+	// R2: Set provider identity for stats recording (after auto-selection).
+	if *coordFlag != "" {
+		cfg.Provider = *coordFlag
+		cfg.Model = *modelFlag
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

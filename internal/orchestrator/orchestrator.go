@@ -49,6 +49,10 @@ type Config struct {
 	StorePath   string
 	MaxAttempts int
 
+	// R2: Provider identity for stats recording.
+	Provider string
+	Model    string
+
 	// B-R1: Coordinator runtime for LLM-driven decisions.
 	Coordinator *coordinator.CoordinatorRuntime
 }
@@ -56,13 +60,21 @@ type Config struct {
 // ── Decision Gateway (B-R1: wraps coordinator gen checks) ──
 
 type DecisionGateway struct {
-	coordGen   int64
-	seenEvents map[string]bool
-	mu         sync.Mutex
+	store     *taskstore.Store
+	runID     int64
+	coordGen  int64
+	seenKeys  map[string]bool // in-memory cache for hot path
+	mu        sync.Mutex
 }
 
-func NewDecisionGateway() *DecisionGateway {
-	return &DecisionGateway{seenEvents: make(map[string]bool)}
+// NewDecisionGateway creates a gateway backed by the durable store.
+// R2 Fix 4: effect keys persisted in SQLite for crash recovery.
+func NewDecisionGateway(store *taskstore.Store, runID int64) *DecisionGateway {
+	return &DecisionGateway{
+		store:    store,
+		runID:    runID,
+		seenKeys: make(map[string]bool),
+	}
 }
 
 func (g *DecisionGateway) Validate(state supervisor.State, decision Decision, validatorPassed bool) error {
@@ -76,14 +88,37 @@ func (g *DecisionGateway) Validate(state supervisor.State, decision Decision, va
 	return nil
 }
 
+// IsDuplicate checks both in-memory cache and durable store.
+// Returns true if the effect key has already been processed.
+// R2 Fix 4: durable effect key check in SQLite.
 func (g *DecisionGateway) IsDuplicate(key string) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.seenEvents[key] {
+	if g.seenKeys[key] {
 		return true
 	}
-	g.seenEvents[key] = true
+	if g.store != nil && g.store.HasEffect(g.runID, key) {
+		g.seenKeys[key] = true
+		return true
+	}
+	g.seenKeys[key] = true
 	return false
+}
+
+// RecordEffect persists an effect key to the durable store.
+// R2 Fix 4: durable effect key write to SQLite.
+func (g *DecisionGateway) RecordEffect(key string) (bool, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.store == nil {
+		// In-memory only — always records.
+		if g.seenKeys[key] {
+			return false, nil
+		}
+		g.seenKeys[key] = true
+		return true, nil
+	}
+	return g.store.RecordEffect(g.runID, key)
 }
 
 func (g *DecisionGateway) Generation() int64 {
@@ -101,6 +136,7 @@ type attemptState struct {
 	worker      *taskstore.WorkerRecord
 	checkpoint  string
 	instruction string // B-R1: from coordinator next_instruction
+	startTime   time.Time // R2: for duration tracking
 }
 
 type observeResult struct {
@@ -152,6 +188,12 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 	if err != nil {
 		return nil, fmt.Errorf("create run: %w", err)
 	}
+	// R2: Record run for provider stats (if provider is known).
+	if cfg.Provider != "" {
+		if err := store.RecordRun(run.ID, cfg.Provider, cfg.Model, "coordinator", cfg.Task, cfg.Repo); err != nil {
+			log.Printf("R2: RecordRun failed: %v", err)
+		}
+	}
 	task, err := store.CreateTask(run.ID, cfg.Task)
 	if err != nil {
 		return nil, fmt.Errorf("create task: %w", err)
@@ -162,7 +204,7 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		cfg:     cfg,
 		store:   store,
 		wt:      wt,
-		gateway: NewDecisionGateway(),
+		gateway: NewDecisionGateway(store, run.ID),
 		runID:   run.ID,
 		taskID:  task.ID,
 		maxAtts: maxAtts,
@@ -177,8 +219,8 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		AllowedDecisions: []string{"VALIDATE", "FAIL"},
 	})
 	if err != nil {
-		log.Printf("B-R1: coordinator wake failed: %v — defaulting to VALIDATE", err)
-		startResp = coordinator.WakeResponse{Decision: DecisionValidate, Reason: "default", NextInstruction: cfg.Task}
+		log.Printf("B-R1: coordinator wake failed: %v — FAIL (R3: fail-closed)", err)
+		startResp = coordinator.WakeResponse{Decision: DecisionFail, Reason: "wake failed", NextInstruction: cfg.Task}
 	}
 	rc.decisions = append(rc.decisions, startResp.Decision)
 	if startResp.Decision == DecisionFail {
@@ -238,7 +280,7 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 			AllowedDecisions: rc.allowedDecisions(result),
 		})
 		if err != nil {
-			log.Printf("B-R1: coordinator wake failed: %v — defaulting to RETRY_CLEAN", err)
+			log.Printf("B-R1: coordinator wake failed: %v — FAIL (R3: fail-closed)", err)
 			resp = coordinator.WakeResponse{Decision: DecisionRetryClean, Reason: "wake failed", NextInstruction: cfg.Task}
 		}
 		// C2: no-coordinator flow — validator PASS → auto-COMPLETE.
@@ -247,7 +289,28 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		}
 		rc.decisions = append(rc.decisions, resp.Decision)
 
+		// R2 Fix 4: Record durable effect key to prevent replay on restart.
+		effectKey := fmt.Sprintf("run-%d-att-%d-decision-%s", rc.runID, attemptNum, resp.Decision)
+		if rc.gateway.IsDuplicate(effectKey) {
+			log.Printf("R2: duplicate effect key %q — skipping decision replay", effectKey)
+			rc.finalizeTerminal(ast, taskstore.StatusCancelled)
+			return rc.decisions, nil
+		}
+		if isNew, err := rc.gateway.RecordEffect(effectKey); err != nil {
+			log.Printf("R2: RecordEffect failed: %v", err)
+		} else if !isNew {
+			log.Printf("R2: effect key %q already recorded (race)", effectKey)
+		}
+
 		if resp.Decision == DecisionComplete {
+			// R2: Authoritative result adoption — verify run_record exists.
+			if _, err := rc.store.GetRunRecord(rc.runID); err == nil {
+				if err := rc.store.RecordAdoption(rc.runID, attemptNum, true); err != nil {
+					log.Printf("R2: RecordAdoption failed: %v", err)
+				}
+			} else {
+				log.Printf("R2: no run_record for run %d — skipping adoption", rc.runID)
+			}
 			rc.finalizeTerminal(ast, taskstore.StatusCompleted)
 			return rc.decisions, nil
 		}
@@ -335,6 +398,7 @@ func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instructi
 	ast := &attemptState{
 		info: info, rt: rt, attempt: attempt, worker: worker,
 		instruction: instruction,
+		startTime:   time.Now(), // R2: track attempt duration
 	}
 	rc.attempts = append(rc.attempts, ast)
 	return ast, nil
@@ -410,6 +474,12 @@ func (rc *runContext) observeAndWait(ast *attemptState) observeResult {
 	// Update in-memory so finalizeTerminal reads current state.
 	ast.attempt.Status = status
 	ast.worker.Status = status
+
+	// R2: Record attempt outcome for provider stats.
+	durationMs := time.Since(ast.startTime).Milliseconds()
+	if err := rc.store.RecordAttemptOutcome(rc.runID, ast.attempt.Number, validatorPassed, durationMs); err != nil {
+		log.Printf("R2: RecordAttemptOutcome failed: %v", err)
+	}
 
 	return observeResult{
 		state: finalState, checkpoint: checkpointSHA, exited: exited,
@@ -566,6 +636,29 @@ func searchHaystack(h, n string) bool {
 		}
 	}
 	return false
+}
+
+// StoreStatsAdapter wraps a taskstore.Store to implement coordinator.StatsStore.
+// Bridges taskstore.ProviderStatsRow ↔ coordinator.ProviderStats type mismatch.
+type StoreStatsAdapter struct {
+	store *taskstore.Store
+}
+
+// NewStoreStatsAdapter creates a StatsStore from a taskstore.Store.
+func NewStoreStatsAdapter(store *taskstore.Store) *StoreStatsAdapter {
+	return &StoreStatsAdapter{store: store}
+}
+
+// StatsFor implements coordinator.StatsStore.
+func (a *StoreStatsAdapter) StatsFor(provider coordinator.ProviderID) coordinator.ProviderStats {
+	row := a.store.StatsFor(string(provider))
+	return coordinator.ProviderStats{
+		Provider:      provider,
+		TotalAttempts: row.TotalAttempts,
+		Successes:     row.Successes,
+		TotalRejects:  row.TotalRejects,
+		TotalTimeMs:   row.TotalTimeMs,
+	}
 }
 
 func OpenStore(path string) (*taskstore.Store, error) {

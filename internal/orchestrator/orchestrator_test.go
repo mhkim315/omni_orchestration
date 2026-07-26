@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -376,6 +377,105 @@ exit 0
 		t.Errorf("final = %s, want COMPLETE", decisions[len(decisions)-1])
 	}
 	os.Remove("/tmp/omni-fake-reasonix-calls")
+}
+
+// TestCrashRestartOSProcess validates that the orchestrator correctly
+// detects when a worker process is killed (SIGKILL) and handles it
+// without hanging. R2 Fix 6: real crash/restart OS process test.
+func TestCrashRestartOSProcess(t *testing.T) {
+	store, _ := taskstore.NewInMemory()
+	defer store.Close()
+
+	repoDir, err := os.MkdirTemp("", "omni-crash-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(repoDir)
+
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "crash@test")
+	runGit(t, repoDir, "config", "user.name", "CrashTest")
+	os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("# crash test"), 0644)
+	runGit(t, repoDir, "add", "README.md")
+	runGit(t, repoDir, "commit", "-m", "init")
+
+	// Mock coordinator: VALIDATE → FAIL (after crash).
+	mock := coordinator.NewMockCoordinator(DecisionValidate, DecisionFail)
+	cr := coordinator.NewCoordinatorRuntime(&runtime.Runtime{}, mock)
+
+	cfg := Config{
+		Repo:        repoDir,
+		Task:        "crash recovery test",
+		Command:     "sleep 30", // long-running, will be killed
+		CWD:         "",
+		Validator:   "true", // always passes (but won't reach for CRASHED)
+		MaxAttempts: 1,
+		Coordinator: cr,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Run orchestrator in a goroutine so we can kill the worker.
+	type runResult struct {
+		decisions []Decision
+		err       error
+	}
+	ch := make(chan runResult, 1)
+	go func() {
+		decisions, err := Run(ctx, cfg, store, worktree.New())
+		ch <- runResult{decisions, err}
+	}()
+
+	// Wait for worker to start — poll for active attempts with a worker.
+	var workerPID int
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		active, _ := store.GetActiveAttempts()
+		for _, a := range active {
+			if w, err := store.GetWorkerByAttempt(a.ID); err == nil && w.PID > 0 {
+				workerPID = w.PID
+				break
+			}
+		}
+		if workerPID > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if workerPID == 0 {
+		t.Fatal("worker did not start within timeout")
+	}
+	t.Logf("worker PID: %d — sending SIGKILL", workerPID)
+
+	// Kill the worker process.
+	proc, err := os.FindProcess(workerPID)
+	if err != nil {
+		t.Fatalf("FindProcess: %v", err)
+	}
+	if err := proc.Signal(os.Kill); err != nil {
+		t.Logf("Signal Kill: %v (may be expected on macOS)", err)
+	}
+	// Also try via exec.Command for reliability.
+	exec.Command("kill", "-9", fmt.Sprintf("%d", workerPID)).Run()
+
+	// Wait for orchestrator to finish.
+	select {
+	case result := <-ch:
+		t.Logf("crash test decisions: %v", result.decisions)
+		if result.err != nil {
+			t.Logf("crash test error (expected): %v", result.err)
+		}
+		if len(result.decisions) == 0 {
+			t.Error("expected at least one decision, got none")
+		}
+		last := result.decisions[len(result.decisions)-1]
+		if last != DecisionFail && last != DecisionRetryClean {
+			t.Errorf("final decision = %s, want FAIL or RETRY_CLEAN", last)
+		}
+	case <-time.After(25 * time.Second):
+		t.Fatal("orchestrator hung after worker kill — crash detection failed")
+	}
 }
 
 // ── Helpers ──

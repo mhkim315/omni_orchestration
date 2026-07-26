@@ -202,6 +202,13 @@ func (s *Store) migrate() error {
 		event_id INTEGER NOT NULL UNIQUE REFERENCES events(id),
 		acked_at TEXT NOT NULL DEFAULT (datetime('now'))
 	);
+	CREATE TABLE IF NOT EXISTS effect_keys (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		run_id INTEGER NOT NULL,
+		effect_key TEXT NOT NULL,
+		created_at TEXT NOT NULL DEFAULT (datetime('now')),
+		UNIQUE(run_id, effect_key)
+	);
 	`
 	_, err := s.db.Exec(ddl)
 	if err != nil {
@@ -627,6 +634,36 @@ func (s *Store) RecordAdoption(runID int64, attemptNum int, adopted bool) error 
 		return err
 	}
 	return nil
+}
+
+// RecordEffect records a durable effect key for a run. Returns false if the
+// effect key already exists (duplicate), true if it was newly inserted.
+// R2 Fix 4: Decision Gateway durable effect keys in SQLite.
+func (s *Store) RecordEffect(runID int64, key string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	res, err := s.db.Exec(
+		"INSERT OR IGNORE INTO effect_keys (run_id, effect_key) VALUES (?, ?)",
+		runID, key,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// HasEffect returns true if the effect key has already been recorded for the run.
+// R2 Fix 4: Decision Gateway durable effect keys in SQLite.
+func (s *Store) HasEffect(runID int64, key string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var count int
+	s.db.QueryRow(
+		"SELECT COUNT(*) FROM effect_keys WHERE run_id=? AND effect_key=?",
+		runID, key,
+	).Scan(&count)
+	return count > 0
 }
 
 // GetProviderStats returns aggregated stats for a provider + task category.
