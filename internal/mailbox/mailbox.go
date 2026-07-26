@@ -77,6 +77,9 @@ type Envelope struct {
 	AckRequired       int             `json:"ack_required"`
 	Acked             int             `json:"acked"`
 	AckedAt           *time.Time      `json:"acked_at,omitempty"`
+	LeasedAt          *time.Time      `json:"leased_at,omitempty"`
+	DeliveryAttempt   int             `json:"delivery_attempt"`
+	LeaseOwner        string          `json:"lease_owner"`
 	CreatedAt         time.Time       `json:"created_at"`
 }
 
@@ -160,8 +163,20 @@ func (s *Store) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_envelopes_message_id ON envelopes(message_id);
 	CREATE INDEX IF NOT EXISTS idx_envelopes_run_id ON envelopes(run_id);
 	`
-	_, err := s.db.Exec(ddl)
-	return err
+	if _, err := s.db.Exec(ddl); err != nil {
+		return err
+	}
+	// v1.2.1 migration: add lease columns for existing databases.
+	for _, col := range []string{"leased_at", "delivery_attempt", "lease_owner"} {
+		def := "TEXT"
+		if col == "delivery_attempt" {
+			def = "INTEGER NOT NULL DEFAULT 0"
+		} else if col == "lease_owner" {
+			def = "TEXT NOT NULL DEFAULT ''"
+		}
+		s.db.Exec("ALTER TABLE envelopes ADD COLUMN " + col + " " + def)
+	}
+	return nil
 }
 
 // ── API ──
@@ -208,7 +223,10 @@ func (s *Store) Enqueue(msg *Envelope) error {
 // Atomically marks the message as in-flight (acked=-1) so concurrent
 // consumers cannot dequeue the same message. Returns nil if no messages
 // are waiting.
-func (s *Store) Dequeue(recipient string) (*Envelope, error) {
+// Dequeue atomically claims the oldest unacked message for a recipient.
+// v1.2.1: lease_owner parameter. CAS UPDATE WHERE acked=0 — multi-process safe.
+// Returns nil if no messages or claim lost to another consumer.
+func (s *Store) Dequeue(recipient, leaseOwner string) (*Envelope, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -216,7 +234,7 @@ func (s *Store) Dequeue(recipient string) (*Envelope, error) {
 	row := s.db.QueryRow(
 		`SELECT message_id FROM envelopes
 		 WHERE recipient=? AND acked=0
-		 ORDER BY created_at ASC LIMIT 1`,
+		 ORDER BY id ASC LIMIT 1`,
 		recipient,
 	)
 	var msgID string
@@ -227,24 +245,31 @@ func (s *Store) Dequeue(recipient string) (*Envelope, error) {
 		return nil, err
 	}
 
-	// Atomically mark in-flight.
-	_, err := s.db.Exec(
-		`UPDATE envelopes SET acked=-1 WHERE message_id=? AND acked=0`,
-		msgID,
+	// v1.2.1 Fix 6: Atomic claim via CAS UPDATE.
+	// Multi-process safe: only one UPDATE succeeds (WHERE acked=0).
+	res, err := s.db.Exec(
+		`UPDATE envelopes SET acked=-1, leased_at=datetime('now'),
+		 delivery_attempt=delivery_attempt+1, lease_owner=?
+		 WHERE message_id=? AND acked=0`,
+		leaseOwner, msgID,
 	)
 	if err != nil {
 		return nil, err
 	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return nil, nil // claimed by another consumer
+	}
 
-	// Re-read to return full envelope.
-	row2 := s.db.QueryRow(
+	// Re-read full envelope.
+	return scanEnvelope(s.db.QueryRow(
 		`SELECT id, message_id, run_id, run_epoch, task_id, task_generation,
 		        attempt_id, attempt_generation, sender, recipient, type,
-		        artifact_refs, payload, ack_required, acked, acked_at, created_at
+		        artifact_refs, payload, ack_required, acked, acked_at,
+		        leased_at, delivery_attempt, lease_owner, created_at
 		 FROM envelopes WHERE message_id=?`,
 		msgID,
-	)
-	return scanEnvelope(row2)
+	))
 }
 
 // Ack marks a message as consumed. Idempotent — re-acking is safe.
@@ -259,20 +284,21 @@ func (s *Store) Ack(messageID string) error {
 	return err
 }
 
-// Redeliver returns unacked messages older than the given timeout.
-// These are candidates for re-delivery after a consumer restart.
-func (s *Store) Redeliver(timeout time.Duration) ([]*Envelope, error) {
+// Redeliver returns unacked/in-flight messages whose lease has expired.
+// v1.2.1 Fix 7: Uses leased_at + timeout, not created_at.
+func (s *Store) Redeliver(leaseTimeout time.Duration) ([]*Envelope, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cutoff := time.Now().Add(-timeout).UTC().Format("2006-01-02 15:04:05")
+	cutoff := time.Now().Add(-leaseTimeout).UTC().Format("2006-01-02 15:04:05")
 	rows, err := s.db.Query(
 		`SELECT id, message_id, run_id, run_epoch, task_id, task_generation,
 		        attempt_id, attempt_generation, sender, recipient, type,
-		        artifact_refs, payload, ack_required, acked, acked_at, created_at
+		        artifact_refs, payload, ack_required, acked, acked_at,
+		        leased_at, delivery_attempt, lease_owner, created_at
 		 FROM envelopes
-		 WHERE acked<=0 AND created_at <= ?
-		 ORDER BY created_at ASC`,
+		 WHERE acked<=0 AND (leased_at IS NULL OR leased_at <= ?)
+		 ORDER BY id ASC`,
 		cutoff,
 	)
 	if err != nil {
@@ -280,6 +306,65 @@ func (s *Store) Redeliver(timeout time.Duration) ([]*Envelope, error) {
 	}
 	defer rows.Close()
 	return scanEnvelopes(rows)
+}
+
+// ── Consumer ──
+
+// Authority validates that an envelope's run/task/attempt are still current.
+// Returns an error if the message should be rejected (stale, cancelled, etc.).
+// v1.2.1 Fix 2+3: Production validation, not test-simulated.
+type Authority func(msg *Envelope) error
+
+// Consumer runs a loop: Dequeue → validate authority → apply effect → ACK.
+// v1.2.1 Fix 4: ACK only AFTER effect success.
+type Consumer struct {
+	store      *Store
+	recipient  string
+	leaseOwner string
+	authority  Authority
+	onEffect   func(*Envelope) error
+}
+
+// NewConsumer creates a consumer that processes messages for a recipient.
+func NewConsumer(store *Store, recipient, leaseOwner string, authority Authority, onEffect func(*Envelope) error) *Consumer {
+	return &Consumer{
+		store: store, recipient: recipient, leaseOwner: leaseOwner,
+		authority: authority, onEffect: onEffect,
+	}
+}
+
+// ProcessOne dequeues and processes a single message.
+// Returns (true, nil) if processed, (false, nil) if queue empty.
+func (c *Consumer) ProcessOne() (bool, error) {
+	msg, err := c.store.Dequeue(c.recipient, c.leaseOwner)
+	if err != nil {
+		return false, err
+	}
+	if msg == nil {
+		return false, nil
+	}
+
+	// 1. Validate authority.
+	if c.authority != nil {
+		if err := c.authority(msg); err != nil {
+			c.store.Ack(msg.MessageID) // reject stale/cancelled
+			return true, nil
+		}
+	}
+
+	// 2. Apply effect (must be idempotent for replay safety).
+	if c.onEffect != nil {
+		if err := c.onEffect(msg); err != nil {
+			return false, fmt.Errorf("effect failed for %s: %w", msg.MessageID, err)
+		}
+	}
+
+	// 3. v1.2.1 Fix 4+5: ACK only AFTER effect success.
+	// If ACK fails, effect was already applied (idempotent replay safe).
+	if err := c.store.Ack(msg.MessageID); err != nil {
+		return true, fmt.Errorf("ack failed (effect applied, replay safe): %w", err)
+	}
+	return true, nil
 }
 
 // GetByMessageID looks up a single message by its message_id.
@@ -290,7 +375,7 @@ func (s *Store) GetByMessageID(messageID string) (*Envelope, error) {
 	row := s.db.QueryRow(
 		`SELECT id, message_id, run_id, run_epoch, task_id, task_generation,
 		        attempt_id, attempt_generation, sender, recipient, type,
-		        artifact_refs, payload, ack_required, acked, acked_at, created_at
+		        artifact_refs, payload, ack_required, acked, acked_at, leased_at, delivery_attempt, lease_owner, created_at
 		 FROM envelopes WHERE message_id=?`,
 		messageID,
 	)
@@ -301,14 +386,13 @@ func (s *Store) GetByMessageID(messageID string) (*Envelope, error) {
 
 func scanEnvelope(row *sql.Row) (*Envelope, error) {
 	var e Envelope
-	var artifactRefs, payload, typeStr, ackedAt sql.NullString
-	var acked int
-	var ackReq int
+	var artifactRefs, payload, typeStr, ackedAt, leasedAt sql.NullString
+	var acked, ackReq, deliveryAttempt int
 	var createdAt string
 	err := row.Scan(&e.ID, &e.MessageID, &e.RunID, &e.RunEpoch,
 		&e.TaskID, &e.TaskGeneration, &e.AttemptID, &e.AttemptGeneration,
 		&e.Sender, &e.Recipient, &typeStr, &artifactRefs, &payload,
-		&ackReq, &acked, &ackedAt, &createdAt)
+		&ackReq, &acked, &ackedAt, &leasedAt, &deliveryAttempt, &e.LeaseOwner, &createdAt)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
@@ -319,6 +403,7 @@ func scanEnvelope(row *sql.Row) (*Envelope, error) {
 	e.ArtifactRefs = artifactRefs.String
 	e.AckRequired = ackReq
 	e.Acked = acked
+	e.DeliveryAttempt = deliveryAttempt
 	if payload.Valid && payload.String != "" {
 		e.Payload = json.RawMessage(payload.String)
 	} else {
@@ -328,6 +413,10 @@ func scanEnvelope(row *sql.Row) (*Envelope, error) {
 		t, _ := time.Parse("2006-01-02 15:04:05", ackedAt.String)
 		e.AckedAt = &t
 	}
+	if leasedAt.Valid {
+		t, _ := time.Parse("2006-01-02 15:04:05", leasedAt.String)
+		e.LeasedAt = &t
+	}
 	e.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
 	return &e, nil
 }
@@ -336,20 +425,20 @@ func scanEnvelopes(rows *sql.Rows) ([]*Envelope, error) {
 	var out []*Envelope
 	for rows.Next() {
 		var e Envelope
-		var artifactRefs, payload, typeStr, ackedAt sql.NullString
-		var acked int
-		var ackReq int
+		var artifactRefs, payload, typeStr, ackedAt, leasedAt sql.NullString
+		var acked, ackReq, deliveryAttempt int
 		var createdAt string
 		if err := rows.Scan(&e.ID, &e.MessageID, &e.RunID, &e.RunEpoch,
 			&e.TaskID, &e.TaskGeneration, &e.AttemptID, &e.AttemptGeneration,
 			&e.Sender, &e.Recipient, &typeStr, &artifactRefs, &payload,
-			&ackReq, &acked, &ackedAt, &createdAt); err != nil {
+			&ackReq, &acked, &ackedAt, &leasedAt, &deliveryAttempt, &e.LeaseOwner, &createdAt); err != nil {
 			return nil, err
 		}
 		e.Type = Type(typeStr.String)
 		e.ArtifactRefs = artifactRefs.String
 		e.AckRequired = ackReq
 		e.Acked = acked
+		e.DeliveryAttempt = deliveryAttempt
 		if payload.Valid && payload.String != "" {
 			e.Payload = json.RawMessage(payload.String)
 		} else {
@@ -358,6 +447,10 @@ func scanEnvelopes(rows *sql.Rows) ([]*Envelope, error) {
 		if ackedAt.Valid {
 			t, _ := time.Parse("2006-01-02 15:04:05", ackedAt.String)
 			e.AckedAt = &t
+		}
+		if leasedAt.Valid {
+			t, _ := time.Parse("2006-01-02 15:04:05", leasedAt.String)
+			e.LeasedAt = &t
 		}
 		e.CreatedAt, _ = time.Parse("2006-01-02 15:04:05", createdAt)
 		out = append(out, &e)

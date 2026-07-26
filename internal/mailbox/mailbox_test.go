@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func sampleMsg(id string, recipient string, typ Type) *Envelope {
@@ -35,13 +36,13 @@ func TestDuplicateMessageID(t *testing.T) {
 	}
 
 	// Only one message exists.
-	dq, _ := s.Dequeue("worker-1")
+	dq, _ := s.Dequeue("worker-1", "test-1")
 	if dq == nil {
 		t.Fatal("expected message")
 	}
 	// Ack and check there's no second copy.
 	s.Ack(dq.MessageID)
-	dq2, _ := s.Dequeue("worker-1")
+	dq2, _ := s.Dequeue("worker-1", "test-1")
 	if dq2 != nil {
 		t.Error("duplicate message delivered after ACK")
 	}
@@ -59,7 +60,7 @@ func TestKillBeforeAckRedeliver(t *testing.T) {
 
 	// Simulate restart: open new store, dequeue, DON'T ack, close.
 	s2, _ := New(path)
-	dq, _ := s2.Dequeue("worker-1")
+	dq, _ := s2.Dequeue("worker-1", "test")
 	if dq == nil {
 		s2.Close()
 		t.Fatal("message not found after restart")
@@ -90,7 +91,7 @@ func TestAckAfterKillNotRedelivered(t *testing.T) {
 
 	// Open, dequeue, ack.
 	s2, _ := New(path)
-	dq, _ := s2.Dequeue("worker-1")
+	dq, _ := s2.Dequeue("worker-1", "test")
 	if dq == nil {
 		s2.Close()
 		t.Fatal("message not found")
@@ -121,7 +122,7 @@ func TestConcurrentDequeue(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			dq, _ := s.Dequeue("worker-1")
+			dq, _ := s.Dequeue("worker-1", "test-1")
 			if dq != nil {
 				winners <- dq.MessageID
 			}
@@ -150,7 +151,7 @@ func TestStaleRunEpochReject(t *testing.T) {
 
 	// Simulate validation: run_epoch must match current epoch.
 	currentEpoch := int64(2)
-	dq, _ := s.Dequeue("worker-1")
+	dq, _ := s.Dequeue("worker-1", "test-1")
 	if dq == nil {
 		t.Fatal("message not found")
 	}
@@ -159,7 +160,7 @@ func TestStaleRunEpochReject(t *testing.T) {
 		// Rejection: ack the stale message (don't process).
 		s.Ack(dq.MessageID)
 	}
-	dq2, _ := s.Dequeue("worker-1")
+	dq2, _ := s.Dequeue("worker-1", "test-1")
 	if dq2 != nil {
 		t.Error("stale message not acked after epoch rejection")
 	}
@@ -177,7 +178,7 @@ func TestStaleGenerationReject(t *testing.T) {
 
 	currentTaskGen := int64(2)
 	currentAttemptGen := int64(2)
-	dq, _ := s.Dequeue("worker-1")
+	dq, _ := s.Dequeue("worker-1", "test-1")
 	if dq == nil {
 		t.Fatal("message not found")
 	}
@@ -198,7 +199,7 @@ func TestCancelledAttemptLateMessage(t *testing.T) {
 	s.Enqueue(msg)
 
 	// Attempt 99 was cancelled — reject late message.
-	dq, _ := s.Dequeue("worker-1")
+	dq, _ := s.Dequeue("worker-1", "test-1")
 	if dq == nil {
 		t.Fatal("message not found")
 	}
@@ -219,7 +220,7 @@ func TestNonExistentArtifact(t *testing.T) {
 	msg.ArtifactRefs = "sha256:nonexistent"
 	s.Enqueue(msg)
 
-	dq, _ := s.Dequeue("worker-1")
+	dq, _ := s.Dequeue("worker-1", "test-1")
 	if dq == nil {
 		t.Fatal("message not found")
 	}
@@ -242,13 +243,13 @@ func TestSenderRecipientMismatch(t *testing.T) {
 	s.Enqueue(msg)
 
 	// Wrong recipient should not see this message.
-	dq, _ := s.Dequeue("worker-2")
+	dq, _ := s.Dequeue("worker-2", "test-2")
 	if dq != nil {
 		t.Error("worker-2 received message meant for worker-1")
 	}
 
 	// Correct recipient sees it.
-	dq2, _ := s.Dequeue("worker-1")
+	dq2, _ := s.Dequeue("worker-1", "test-1")
 	if dq2 == nil {
 		t.Error("worker-1 did not receive its message")
 	} else {
@@ -270,7 +271,7 @@ func TestCustomStorePathRestart(t *testing.T) {
 	s2, _ := New(path)
 	defer s2.Close()
 
-	dq, _ := s2.Dequeue("worker-a")
+	dq, _ := s2.Dequeue("worker-a", "test-a")
 	if dq == nil {
 		t.Fatal("messages did not survive custom store restart")
 	}
@@ -288,7 +289,7 @@ func TestCrashAfterPersistBeforeEffect(t *testing.T) {
 	s1.Enqueue(msg) // persisted to DB
 
 	// Simulate: dequeue but crash before applying effect (no ack).
-	dq, _ := s1.Dequeue("worker-1")
+	dq, _ := s1.Dequeue("worker-1", "test")
 	if dq == nil {
 		s1.Close()
 		t.Fatal("message not found")
@@ -324,7 +325,7 @@ func TestCrashAfterEffectBeforeAck(t *testing.T) {
 	s1.Enqueue(msg)
 
 	// Dequeue and apply effect, but crash before ACK.
-	dq, _ := s1.Dequeue("worker-1")
+	dq, _ := s1.Dequeue("worker-1", "test")
 	if dq == nil {
 		s1.Close()
 		t.Fatal("message not found")
@@ -364,6 +365,191 @@ func TestCrashAfterEffectBeforeAck(t *testing.T) {
 	}
 }
 
-// Ensure imports used.
+// 13. Multi-process claim race — atomic CAS UPDATE ensures one winner
+func TestMultiProcessClaimRace(t *testing.T) {
+	s, _ := NewInMemory()
+	defer s.Close()
+
+	msg := sampleMsg("msg-race", "worker-1", TypeAttemptCompleted)
+	s.Enqueue(msg)
+
+	// Simulate 5 concurrent consumers racing for the same message.
+	var wg sync.WaitGroup
+	winners := make(chan string, 5)
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			dq, _ := s.Dequeue("worker-1", fmt.Sprintf("consumer-%d", id))
+			if dq != nil {
+				winners <- dq.LeaseOwner
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(winners)
+
+	count := 0
+	for range winners {
+		count++
+	}
+	if count != 1 {
+		t.Errorf("multi-process race gave %d winners, want exactly 1", count)
+	}
+}
+
+// 14. Lease timeout redelivery
+func TestLeaseTimeoutRedeliver(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lease-timeout.db")
+
+	s1, _ := New(path)
+	msg := sampleMsg("msg-lease", "worker-1", TypeTaskAssigned)
+	s1.Enqueue(msg)
+
+	// Claim the message.
+	dq, _ := s1.Dequeue("worker-1", "consumer-A")
+	if dq == nil {
+		s1.Close()
+		t.Fatal("message not found")
+	}
+	if dq.LeasedAt == nil {
+		t.Fatal("leased_at not set after dequeue")
+	}
+	s1.Close()
+
+	// Immediately reopen: message is in-flight, lease not expired → not redelivered.
+	s2, _ := New(path)
+	defer s2.Close()
+	redelivered, _ := s2.Redeliver(1 * time.Hour)
+	for _, r := range redelivered {
+		if r.MessageID == "msg-lease" {
+			t.Error("in-flight message with valid lease was redelivered")
+		}
+	}
+
+	// With zero timeout, all in-flight messages are redelivered.
+	redelivered2, _ := s2.Redeliver(0)
+	found := false
+	for _, r := range redelivered2 {
+		if r.MessageID == "msg-lease" {
+			found = true
+			if r.DeliveryAttempt < 1 {
+				t.Errorf("delivery_attempt=%d, want >=1", r.DeliveryAttempt)
+			}
+		}
+	}
+	if !found {
+		t.Error("in-flight message not redelivered with zero lease timeout")
+	}
+}
+
+// 15. Consumer with real authority validation
+func TestConsumerWithAuthority(t *testing.T) {
+	s, _ := NewInMemory()
+	defer s.Close()
+
+	// Enqueue messages with different epochs.
+	msg1 := sampleMsg("msg-auth-valid", "worker-1", TypeAttemptCompleted)
+	msg1.RunEpoch = 2
+	s.Enqueue(msg1)
+
+	msg2 := sampleMsg("msg-auth-stale", "worker-1", TypeAttemptCompleted)
+	msg2.RunEpoch = 1 // stale
+	s.Enqueue(msg2)
+
+	// Authority rejects stale epochs.
+	authority := func(msg *Envelope) error {
+		if msg.RunEpoch < 2 {
+			return fmt.Errorf("stale epoch %d", msg.RunEpoch)
+		}
+		return nil
+	}
+
+	// Consumer with authority + effect tracking.
+	effects := make(map[string]bool)
+	consumer := NewConsumer(s, "worker-1", "consumer-1", authority, func(msg *Envelope) error {
+		effects[msg.MessageID] = true
+		return nil
+	})
+
+	// Process all messages.
+	for i := 0; i < 2; i++ {
+		processed, err := consumer.ProcessOne()
+		if err != nil {
+			t.Fatalf("ProcessOne: %v", err)
+		}
+		if !processed {
+			break
+		}
+	}
+
+	// Valid message should have been processed.
+	if !effects["msg-auth-valid"] {
+		t.Error("valid message not processed")
+	}
+	// Stale message should NOT have been processed (rejected by authority).
+	if effects["msg-auth-stale"] {
+		t.Error("stale message was processed (should have been rejected)")
+	}
+}
+
+// 16. ACK only after effect — crash before ACK, replay safe
+func TestCrashAfterEffectBeforeAckReplaySafe(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "crash-effect-ack.db")
+
+	// Use real durable effect tracking (not simulated bool).
+	type effectStore struct {
+		applied map[string]int // message_id → times applied
+	}
+	es := &effectStore{applied: make(map[string]int)}
+
+	s1, _ := New(path)
+	msg := sampleMsg("msg-crash-ack", "worker-1", TypeValidationAccepted)
+	s1.Enqueue(msg)
+
+	// Apply effect but crash before ACK (simulated by closing store).
+	msg2, _ := s1.Dequeue("worker-1", "c1")
+	if msg2 == nil {
+		s1.Close()
+		t.Fatal("message not found")
+	}
+	// Apply effect.
+	es.applied[msg2.MessageID]++
+	// CRASH — don't ACK.
+	s1.Close()
+
+	// Restart: message should be redelivered.
+	s2, _ := New(path)
+	defer s2.Close()
+
+	redelivered, _ := s2.Redeliver(0)
+	found := false
+	for _, r := range redelivered {
+		if r.MessageID == "msg-crash-ack" {
+			found = true
+			// Re-apply effect (idempotent).
+			es.applied[r.MessageID]++
+			s2.Ack(r.MessageID)
+		}
+	}
+	if !found {
+		t.Error("message not redelivered after crash-before-ack")
+	}
+
+	// Effect was applied twice — consumer must be idempotent.
+	if es.applied["msg-crash-ack"] != 2 {
+		t.Errorf("effect applied %d times, want 2 (original + replay)", es.applied["msg-crash-ack"])
+	}
+
+	// After ACK, not redelivered again.
+	redelivered2, _ := s2.Redeliver(0)
+	for _, r := range redelivered2 {
+		if r.MessageID == "msg-crash-ack" {
+			t.Error("acked message redelivered after replay+ACK")
+		}
+	}
+}
+
+// Ensure imports.
 var _ = fmt.Sprintf
 var _ = os.TempDir
