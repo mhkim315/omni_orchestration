@@ -8,6 +8,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os/exec"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mhkim315/omni_orchestration/internal/coordinator"
+	"github.com/mhkim315/omni_orchestration/internal/mailbox"
 	"github.com/mhkim315/omni_orchestration/internal/runtime"
 	"github.com/mhkim315/omni_orchestration/internal/supervisor"
 	"github.com/mhkim315/omni_orchestration/internal/taskstore"
@@ -52,6 +54,9 @@ type Config struct {
 	// R2: Provider identity for stats recording.
 	Provider string
 	Model    string
+
+	// v1.2: Durable mailbox for message delivery.
+	Mailbox *mailbox.Store
 
 	// B-R1: Coordinator runtime for LLM-driven decisions.
 	Coordinator *coordinator.CoordinatorRuntime
@@ -480,6 +485,41 @@ func (rc *runContext) observeAndWait(ast *attemptState) observeResult {
 	// Update in-memory so finalizeTerminal reads current state.
 	ast.attempt.Status = status
 	ast.worker.Status = status
+
+	// v1.2: Enqueue mailbox messages after attempt completes.
+	if rc.cfg.Mailbox != nil {
+		msgID := fmt.Sprintf("attempt-%d-completed", ast.attempt.ID)
+		mailMsg := &mailbox.Envelope{
+			MessageID: msgID, RunID: rc.runID, RunEpoch: 1,
+			TaskID: rc.taskID, TaskGeneration: 1,
+			AttemptID: ast.attempt.ID, AttemptGeneration: 1,
+			Sender: "orchestrator", Recipient: "coordinator",
+			Type: mailbox.TypeAttemptCompleted,
+			Payload: json.RawMessage(fmt.Sprintf(`{"status":"%s","validator_passed":%v}`,
+				status, validatorPassed)),
+		}
+		if err := rc.cfg.Mailbox.Enqueue(mailMsg); err != nil {
+			log.Printf("mailbox: enqueue ATTEMPT_COMPLETED failed: %v", err)
+		}
+
+		// Validation result as separate message.
+		valType := mailbox.TypeValidationRejected
+		if validatorPassed {
+			valType = mailbox.TypeValidationAccepted
+		}
+		valMsgID := fmt.Sprintf("attempt-%d-validation", ast.attempt.ID)
+		valMsg := &mailbox.Envelope{
+			MessageID: valMsgID, RunID: rc.runID, RunEpoch: 1,
+			TaskID: rc.taskID, TaskGeneration: 1,
+			AttemptID: ast.attempt.ID, AttemptGeneration: 1,
+			Sender: "orchestrator", Recipient: "coordinator",
+			Type:    valType,
+			Payload: json.RawMessage(fmt.Sprintf(`{"passed":%v}`, validatorPassed)),
+		}
+		if err := rc.cfg.Mailbox.Enqueue(valMsg); err != nil {
+			log.Printf("mailbox: enqueue %s failed: %v", valType, err)
+		}
+	}
 
 	// R2: Record attempt outcome for provider stats.
 	durationMs := time.Since(ast.startTime).Milliseconds()
