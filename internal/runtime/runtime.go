@@ -440,13 +440,18 @@ func commandMatches(stored, actual string) bool {
 
 	// R10: Shell-wrapper match. When the worker command is run via bash -c "...",
 	// the actual process appears as "bash" (or "sh"/"zsh") but the stored command
-	// is the shell script. Multi-word commands or commands with shell syntax
-	// (;, |, &&, etc.) imply execution under a shell.
+	// is the shell script. Multi-word commands imply execution under a shell.
 	knownShells := map[string]bool{"bash": true, "sh": true, "zsh": true, "dash": true}
 	if knownShells[actual] && strings.Contains(stored, " ") {
-		// Stored has spaces (multi-word shell command) and actual is a shell.
-		// The shell IS running our command. Identity verified.
 		return true
+	}
+
+	// R13: Any-token match — handles prefix wrappers like "nohup sleep 5"
+	// where actual="sleep" appears as a token in the stored command.
+	for _, token := range strings.Fields(stored) {
+		if filepath.Base(token) == actual {
+			return true
+		}
 	}
 
 	return false

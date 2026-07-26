@@ -29,6 +29,11 @@ const (
 type Store struct {
 	db *sql.DB
 	mu sync.Mutex
+
+	// ForceAdoptionError, when non-nil, is returned by RecordAdoption instead
+	// of performing the update. Test hook for exercising the adoption rejection
+	// path through orchestrator.Run().
+	ForceAdoptionError error
 }
 
 // Run represents an orchestrator run.
@@ -627,6 +632,10 @@ type ProviderStatsRow struct {
 
 // RecordAdoption marks the final adopted attempt for a run.
 func (s *Store) RecordAdoption(runID int64, attemptNum int, adopted bool) error {
+	// R13: Test hook — force adoption failure for rejection path testing.
+	if s.ForceAdoptionError != nil {
+		return s.ForceAdoptionError
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if adopted {

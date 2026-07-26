@@ -66,14 +66,16 @@ func Reconcile(store *taskstore.Store, wt *worktree.Manager) ReconcileResult {
 			if t, err := store.GetTask(taskID); err == nil {
 				runID = t.RunID
 			}
+			var wPID int
 			if w, err := store.GetWorkerByAttempt(a.ID); err == nil {
+				wPID = w.PID
 				store.UpdateWorkerStatus(w.ID, StatusInterrupted)
 			}
 			store.UpdateAttemptStatus(a.ID, StatusInterrupted)
 			store.UpdateRunStatus(runID, StatusInterrupted)
 			store.UpdateTaskStatus(taskID, StatusInterrupted)
 			r.Interrupted++
-			log.Printf("RECOVERY: attempt %d (no checkpoint, worker dead) fully terminalized", a.ID)
+			log.Printf("RECOVERY: attempt %d pid %d (no checkpoint, worker dead) fully terminalized", a.ID, wPID)
 		} else if a.CheckpointCommit != "" {
 			cpshort := a.CheckpointCommit
 			if len(cpshort) > 8 {
