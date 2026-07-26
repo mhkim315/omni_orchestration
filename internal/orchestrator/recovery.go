@@ -91,9 +91,9 @@ func ResumeRun(ctx context.Context, cfg Config, store *taskstore.Store, wt *work
 	return Run(ctx, cfg, store, wt)
 }
 
-// ResumeWithRecovery reconciles orphan runs, then creates a new run
-// for the configured task. This is the recommended entry point for
-// `orchestrator recover` or `orchestrator run --resume`.
+// ResumeWithRecovery reconciles orphan runs. If active attempts exist
+// after reconcile, returns their state without creating a new run.
+// If no active attempts remain, falls through to create a new run.
 func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.Manager) ([]Decision, error) {
 	result := Reconcile(store, wt)
 	if len(result.Errors) > 0 {
@@ -106,6 +106,20 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 		log.Printf("RECOVERY: %d attempts interrupted, %d orphan runs reconciled",
 			result.Interrupted, result.OrphanRuns)
 	}
+
+	// If active runs exist after reconcile, re-own their workers
+	// instead of creating a new run.
+	active, _ := store.GetActiveAttempts()
+	if len(active) > 0 {
+		log.Printf("RESUME: %d active attempts after reconcile — re-owning workers", len(active))
+		var decisions []Decision
+		for _, a := range active {
+			decisions = append(decisions, DecisionRetryClean)
+			store.UpdateAttemptStatus(a.ID, taskstore.StatusRunning)
+		}
+		return decisions, nil
+	}
+
 	return Run(ctx, cfg, store, wt)
 }
 

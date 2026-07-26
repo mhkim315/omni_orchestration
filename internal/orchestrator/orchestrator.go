@@ -245,10 +245,13 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		rc.decisions = append(rc.decisions, resp.Decision)
 
 		if resp.Decision == DecisionComplete {
+			store.UpdateRunStatus(run.ID, taskstore.StatusCompleted)
 			store.UpdateTaskStatus(task.ID, taskstore.StatusCompleted)
+			store.UpdateWorkerStatus(ast.worker.ID, taskstore.StatusCompleted)
 			return rc.decisions, nil
 		}
 		if resp.Decision == DecisionFail {
+			store.UpdateRunStatus(run.ID, taskstore.StatusFailed)
 			store.UpdateTaskStatus(task.ID, taskstore.StatusFailed)
 			return rc.decisions, nil
 		}
@@ -323,7 +326,7 @@ func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instructi
 	}
 
 	// B-R1: Write coordinator instruction to worker stdin.
-	if instruction != "" && instruction != rc.cfg.Task {
+	if instruction != "" {
 		rt.Write(rt.Generation(), []byte(instruction+"\n"))
 	}
 
@@ -390,7 +393,7 @@ func (rc *runContext) observeAndWait(ast *attemptState) observeResult {
 
 	// Run validator.
 	validatorPassed := false
-	if rc.cfg.Validator != "" && checkpointSHA != "" {
+	if rc.cfg.Validator != "" {
 		validatorPassed = rc.runValidator(ast.info.Path, rc.cfg.Validator)
 	}
 
