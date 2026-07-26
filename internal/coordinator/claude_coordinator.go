@@ -92,7 +92,7 @@ Decision:`,
 // parseClaudeDecision extracts the JSON decision from Claude's output.
 // Claude --output-format json returns a single JSON object.
 func parseClaudeDecision(output string) (Result, error) {
-	decoded := extractJSON(output)
+	decoded := extractClaudeCodeBlock(output)
 	if decoded == nil {
 		return Result{
 			Decision: DecisionFail,

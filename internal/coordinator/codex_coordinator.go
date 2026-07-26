@@ -83,7 +83,7 @@ Decision:`,
 
 // parseCodexDecision extracts the JSON decision from codex output.
 func parseCodexDecision(output string) (Result, error) {
-	decoded := extractJSON(output)
+	decoded := extractCodexJSONL(output)
 	if decoded == nil {
 		return Result{
 			Decision: DecisionFail,

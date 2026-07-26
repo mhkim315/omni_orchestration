@@ -96,14 +96,12 @@ func parseReasonixResponse(out []byte) (Result, error) {
 		return Result{Decision: DecisionFail, Reason: "reasonix: empty response"}, nil
 	}
 
-	// Find the JSON object in the output (Reasonix may include commentary).
-	start := strings.Index(text, "{")
-	end := strings.LastIndex(text, "}")
-	if start < 0 || end <= start {
+	decoded := extractReasonixCommentary(text)
+	if decoded == nil {
 		return Result{Decision: DecisionFail, Reason: "reasonix: no JSON found in response"}, nil
 	}
 
-	jsonStr := text[start : end+1]
+	jsonStr := string(decoded)
 	var parsed struct {
 		Decision string `json:"decision"`
 		Reason   string `json:"reason"`

@@ -78,6 +78,7 @@ func (c *CoordinatorRuntime) Generation() int64 {
 // SetTimeout overrides the default 120s wake timeout.
 func (c *CoordinatorRuntime) SetTimeout(d time.Duration) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.timeout = d
 }
 

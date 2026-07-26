@@ -34,7 +34,7 @@ func (c *AGYCoordinator) Decide(ctx context.Context, state RunState) (Result, er
 
 	prompt := buildAGYPrompt(state)
 
-	args := []string{"--print", "--print-timeout", "120s", "--dangerously-skip-permissions"}
+	args := []string{"--print", "--print-timeout", "120s"}
 	if c.Model != "" {
 		args = append(args, "--model", c.Model)
 	}
@@ -91,7 +91,7 @@ Decision:`,
 
 // parseAGYDecision extracts the JSON decision from AGY output.
 func parseAGYDecision(output string) (Result, error) {
-	decoded := extractJSON(output)
+	decoded := extractAGYPrint(output)
 	if decoded == nil {
 		return Result{
 			Decision: DecisionFail,
