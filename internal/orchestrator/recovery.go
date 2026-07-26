@@ -133,6 +133,8 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 			if err != nil {
 				log.Printf("RESUME: attempt %d no worker record: %v", a.ID, err)
 				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
+				store.UpdateRunStatus(runID, taskstore.StatusFailed)
+				store.UpdateTaskStatus(taskID, taskstore.StatusFailed)
 				decisions = append(decisions, DecisionFail)
 				continue
 			}
@@ -143,6 +145,9 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 			if err := syscall.Kill(w.PID, 0); err != nil {
 				log.Printf("RESUME: attempt %d pid %d not alive: %v — fail closed", a.ID, w.PID, err)
 				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
+				store.UpdateWorkerStatus(w.ID, taskstore.StatusFailed)
+				store.UpdateRunStatus(runID, taskstore.StatusFailed)
+				store.UpdateTaskStatus(taskID, taskstore.StatusFailed)
 				decisions = append(decisions, DecisionFail)
 				continue
 			}
@@ -156,6 +161,9 @@ func ResumeWithRecovery(ctx context.Context, cfg Config, store *taskstore.Store,
 			if err := rt.Attach(w.PID, id, w.Generation); err != nil {
 				log.Printf("RESUME: attempt %d attach failed: %v", a.ID, err)
 				store.UpdateAttemptStatus(a.ID, taskstore.StatusFailed)
+				store.UpdateWorkerStatus(w.ID, taskstore.StatusFailed)
+				store.UpdateRunStatus(runID, taskstore.StatusFailed)
+				store.UpdateTaskStatus(taskID, taskstore.StatusFailed)
 				decisions = append(decisions, DecisionFail)
 				continue
 			}
