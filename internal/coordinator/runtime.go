@@ -149,14 +149,12 @@ func (c *CoordinatorRuntime) Wake(ctx context.Context, generation int64, pkt Wak
 // new generation for subsequent Wake calls.
 func (c *CoordinatorRuntime) Replace(ctx context.Context, newRT *runtime.Runtime) *CoordinatorRuntime {
 	c.mu.Lock()
+	defer c.mu.Unlock()
 	oldGen := c.gen.Load()
 	c.rt.Stop(ctx)
 	c.rt = newRT
 	c.id = newRT.ID()
 	c.gen.Store(oldGen + 1)
-	newGen := c.gen.Load()
-
-	_ = newGen
 	return c
 }
 

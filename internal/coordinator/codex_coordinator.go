@@ -32,7 +32,7 @@ func (c *CodexCoordinator) Decide(ctx context.Context, state RunState) (Result, 
 
 	prompt := buildCodexPrompt(state)
 
-	args := []string{"exec", "--json"}
+	args := []string{"exec", "--json", "--sandbox", "read-only"}
 	if c.Model != "" {
 		args = append(args, "--model", c.Model)
 	}

@@ -6,14 +6,14 @@ import (
 )
 
 // extractCodexJSONL handles the Codex exec --json output format.
-// Codex wraps results in JSONL: {"type":"result","message":{"content":[...]}}
-// The actual decision JSON is embedded in the content text.
+// Codex wraps results in JSONL with two formats:
+//  1. {"type":"result","message":{"content":[{"type":"text","text":"{...}"}]}}
+//  2. {"type":"item.completed","item":{"type":"agent_message","text":"{...}"}}
 func extractCodexJSONL(output string) []byte {
 	// Try direct parse first (bare JSON).
 	if json.Valid([]byte(output)) {
 		return []byte(output)
 	}
-	// Parse each JSONL line, looking for the "result" type with embedded content.
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -27,12 +27,26 @@ func extractCodexJSONL(output string) []byte {
 					Text string `json:"text"`
 				} `json:"content"`
 			} `json:"message"`
+			Item struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"item"`
 		}
-		if json.Unmarshal([]byte(line), &wrapper) == nil && wrapper.Type == "result" {
+		if json.Unmarshal([]byte(line), &wrapper) != nil {
+			continue
+		}
+		// Format 1: result wrapper.
+		if wrapper.Type == "result" {
 			for _, c := range wrapper.Message.Content {
 				if c.Type == "text" && json.Valid([]byte(c.Text)) {
 					return []byte(c.Text)
 				}
+			}
+		}
+		// Format 2: item.completed with agent_message.
+		if wrapper.Type == "item.completed" && wrapper.Item.Type == "agent_message" {
+			if json.Valid([]byte(wrapper.Item.Text)) {
+				return []byte(wrapper.Item.Text)
 			}
 		}
 	}
@@ -40,13 +54,26 @@ func extractCodexJSONL(output string) []byte {
 }
 
 // extractClaudeCodeBlock handles Claude -p --output-format json.
-// Claude may return bare JSON or JSON wrapped in code fences.
+// Claude may return:
+//  1. Bare JSON: {"decision":"VALIDATE",...}
+//  2. Result wrapper: {"result":"{\\"decision\\":\\"VALIDATE\\",...}"}
+//  3. Code fence: ```json {...} ```
 func extractClaudeCodeBlock(output string) []byte {
-	// Try bare JSON first (Claude --output-format json returns it directly).
+	// Try bare JSON first.
 	if json.Valid([]byte(output)) {
 		return []byte(output)
 	}
-	// Try code fence extraction.
+	// Try top-level result string wrapper.
+	var wrapper struct {
+		Result string `json:"result"`
+	}
+	if json.Unmarshal([]byte(output), &wrapper) == nil && wrapper.Result != "" {
+		unescaped := strings.ReplaceAll(wrapper.Result, `\"`, `"`)
+		if json.Valid([]byte(unescaped)) {
+			return []byte(unescaped)
+		}
+	}
+	// Try code fence.
 	if idx := strings.Index(output, "```json"); idx >= 0 {
 		start := idx + 7
 		if end := strings.Index(output[start:], "```"); end >= 0 {
@@ -56,7 +83,6 @@ func extractClaudeCodeBlock(output string) []byte {
 			}
 		}
 	}
-	// Fall back to generic extraction.
 	return extractJSON(output)
 }
 

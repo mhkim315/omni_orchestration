@@ -95,9 +95,18 @@ func New(path string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1) // SQLite serializes writes
 
-	// HIGH: SQLite store must be owner-only.
+	// Verify the database is reachable before setting permissions.
+	if err := db.Ping(); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("ping: %w", err)
+	}
+
+	// HIGH: SQLite store must be owner-only. Chmod AFTER the file exists.
 	if path != ":memory:" {
-		os.Chmod(path, 0600)
+		if err := os.Chmod(path, 0600); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("chmod: %w", err)
+		}
 	}
 
 	s := &Store{db: db}
