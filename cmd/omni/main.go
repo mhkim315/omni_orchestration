@@ -573,11 +573,14 @@ func fleetCmd(args []string) error {
 		if taskRepo == "" {
 			taskRepo = repo
 		}
-		var dependsOn int64
-		if len(t.DependsOn) > 0 {
-			dependsOn = taskIDs[t.DependsOn[0]]
+		// v3.0.3: Multi-parent DAG — use task_dependencies table.
+		var dependsOnIDs []int64
+		for _, depIdx := range t.DependsOn {
+			if depID, ok := taskIDs[depIdx]; ok {
+				dependsOnIDs = append(dependsOnIDs, depID)
+			}
 		}
-		dt, err := dagStore.CreateTaskWithRepo(1, t.Title, dependsOn, taskRepo)
+		dt, err := dagStore.CreateTaskMultiDep(1, t.Title, dependsOnIDs, taskRepo)
 		if err != nil {
 			return fmt.Errorf("create task %d: %w", i+1, err)
 		}
@@ -586,7 +589,7 @@ func fleetCmd(args []string) error {
 		for _, p := range t.OwnedPaths {
 			dagStore.AcquirePathLease(dt.ID, p)
 		}
-		log.Printf("fleet: task %d (%s) repo=%s depends_on=%d", dt.ID, dt.Title, dt.Repo, dependsOn)
+		log.Printf("fleet: task %d (%s) repo=%s depends_on=%v", dt.ID, dt.Title, dt.Repo, dependsOnIDs)
 	}
 
 	// Initialize daemon + tracker with maxWorkers.

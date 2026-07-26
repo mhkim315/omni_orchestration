@@ -177,7 +177,14 @@ func (t *Tracker) executeTask(ctx context.Context, task *dag.Task) {
 
 	cfg := t.cfg
 	cfg.Task = task.Title
-	cfg.Command = fmt.Sprintf("echo 'task %d executing'", task.ID)
+	// v3.0.3: Use real task fields (Command, Repo, OwnedPaths).
+	cfg.Command = task.Command
+	if cfg.Command == "" {
+		cfg.Command = fmt.Sprintf("echo \"task %d executing\"", task.ID)
+	}
+	if task.Repo != "" {
+		cfg.Repo = task.Repo
+	}
 
 	go func() {
 		defer func() {

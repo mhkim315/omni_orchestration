@@ -40,6 +40,7 @@ type Task struct {
 	RunID           int64     `json:"run_id"`
 	Title           string    `json:"title"`
 	Status          string    `json:"status"`
+	Command         string    `json:"command,omitempty"`
 	DependsOnTaskID int64     `json:"depends_on_task_id,omitempty"`
 	Repo            string    `json:"repo,omitempty"`
 	CreatedAt       time.Time `json:"created_at"`
@@ -181,6 +182,28 @@ func (s *Store) CreateTask(runID int64, title string, dependsOn int64) (*Task, e
 }
 
 // CreateTaskWithRepo creates a task with a per-task repo override.
+// CreateTaskMultiDep creates a task with multiple dependencies (v3.0.3).
+func (s *Store) CreateTaskMultiDep(runID int64, title string, dependsOnIDs []int64, repo string) (*Task, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	status := StatusPending
+	if len(dependsOnIDs) > 0 {
+		status = StatusBlocked
+	}
+	res, err := s.db.Exec(
+		"INSERT INTO dag_tasks (run_id, title, status, depends_on_task_id, repo) VALUES (?,?,?,?,?)",
+		runID, title, status, 0, repo,
+	)
+	if err != nil {
+		return nil, err
+	}
+	id, _ := res.LastInsertId()
+	for _, depID := range dependsOnIDs {
+		s.db.Exec("INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id) VALUES (?,?)", id, depID)
+	}
+	return s.getTask(id)
+}
+
 func (s *Store) CreateTaskWithRepo(runID int64, title string, dependsOn int64, repo string) (*Task, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
