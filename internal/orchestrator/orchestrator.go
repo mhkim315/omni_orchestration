@@ -60,11 +60,11 @@ type Config struct {
 // ── Decision Gateway (B-R1: wraps coordinator gen checks) ──
 
 type DecisionGateway struct {
-	store     *taskstore.Store
-	runID     int64
-	coordGen  int64
-	seenKeys  map[string]bool // in-memory cache for hot path
-	mu        sync.Mutex
+	store    *taskstore.Store
+	runID    int64
+	coordGen int64
+	seenKeys map[string]bool // in-memory cache for hot path
+	mu       sync.Mutex
 }
 
 // NewDecisionGateway creates a gateway backed by the durable store.
@@ -135,7 +135,7 @@ type attemptState struct {
 	attempt     *taskstore.Attempt
 	worker      *taskstore.WorkerRecord
 	checkpoint  string
-	instruction string // B-R1: from coordinator next_instruction
+	instruction string    // B-R1: from coordinator next_instruction
 	startTime   time.Time // R2: for duration tracking
 }
 

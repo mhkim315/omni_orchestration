@@ -739,3 +739,20 @@ func (s *Store) GetBestProvider(taskCategory, repo string) (string, *ProviderSta
 	stats, _ := s.GetProviderStats(provider, taskCategory)
 	return provider, stats, nil
 }
+
+// ── Durable Effect Keys (R3 Fix 4) ──
+
+// HasEffectKey returns true if an effect key was already recorded (dedup).
+func (s *Store) HasEffectKey(key string) bool {
+	var count int
+	s.db.QueryRow("SELECT COUNT(*) FROM event_acks WHERE event_id=(SELECT id FROM events WHERE type='effect' AND payload LIKE ?)", "%"+key+"%").Scan(&count)
+	return count > 0
+}
+
+// RecordEffectKey stores a durable effect key for replay protection.
+func (s *Store) RecordEffectKey(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec("INSERT INTO events (type, payload) VALUES ('effect', ?)", key)
+	return err
+}
