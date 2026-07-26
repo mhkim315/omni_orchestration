@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -881,6 +882,26 @@ func TestC4_GenerationGating_ConcurrentReplace(t *testing.T) {
 	if !errors.Is(err, ErrStaleCoordinator) {
 		t.Errorf("concurrent replace: expected ErrStaleCoordinator, got %v", err)
 	}
+}
+
+func TestCloseReplaceRace(t *testing.T) {
+	rt := runtime.New()
+	rt.Start("echo race-test", "/tmp")
+	cr := NewCoordinatorRuntime(rt, NewMockCoordinator(DecisionValidate))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); cr.Close(context.Background()) }()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rt2 := runtime.New()
+			rt2.Start("echo replace-race", "/tmp")
+			cr.Replace(context.Background(), rt2)
+		}()
+	}
+	wg.Wait()
 }
 
 // ── Helpers ──

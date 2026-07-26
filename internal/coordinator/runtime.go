@@ -168,7 +168,10 @@ func (c *CoordinatorRuntime) Replace(ctx context.Context, newRT *runtime.Runtime
 
 // Close stops the underlying runtime.
 func (c *CoordinatorRuntime) Close(ctx context.Context) error {
-	return c.rt.Stop(ctx)
+	c.mu.Lock()
+	rt := c.rt
+	c.mu.Unlock()
+	return rt.Stop(ctx)
 }
 
 // isAllowed checks whether a decision is in the allowed set.
