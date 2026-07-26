@@ -68,7 +68,11 @@ func NewCoordinatorRuntime(rt *runtime.Runtime, coord Coordinator) *CoordinatorR
 }
 
 // ID returns the coordinator identity.
-func (c *CoordinatorRuntime) ID() string { return c.id }
+func (c *CoordinatorRuntime) ID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.id
+}
 
 // Generation returns the current coordinator generation.
 func (c *CoordinatorRuntime) Generation() int64 {

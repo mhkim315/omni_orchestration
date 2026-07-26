@@ -59,11 +59,9 @@ func extractCodexJSONL(output string) []byte {
 //  2. Result wrapper: {"result":"{\\"decision\\":\\"VALIDATE\\",...}"}
 //  3. Code fence: ```json {...} ```
 func extractClaudeCodeBlock(output string) []byte {
-	// Try bare JSON first.
-	if json.Valid([]byte(output)) {
-		return []byte(output)
-	}
-	// Try top-level result string wrapper.
+	// Try top-level result wrapper FIRST (before bare JSON).
+	// {"result":"{\\"decision\\":...}"} is valid JSON — bare check
+	// would return the wrapper, not the inner decision.
 	var wrapper struct {
 		Result string `json:"result"`
 	}
@@ -72,6 +70,10 @@ func extractClaudeCodeBlock(output string) []byte {
 		if json.Valid([]byte(unescaped)) {
 			return []byte(unescaped)
 		}
+	}
+	// Try bare JSON.
+	if json.Valid([]byte(output)) {
+		return []byte(output)
 	}
 	// Try code fence.
 	if idx := strings.Index(output, "```json"); idx >= 0 {
