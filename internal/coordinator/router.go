@@ -61,7 +61,12 @@ type Router struct {
 }
 
 // NewRouter creates a performance-based provider router.
+// If store is nil, a memory store is used (all stats zero) and the default
+// provider (Codex) is returned for all queries until stats are populated.
 func NewRouter(store StatsStore) *Router {
+	if store == nil {
+		store = newMemoryStatsStore()
+	}
 	return &Router{store: store, defaultID: ProviderCodex}
 }
 

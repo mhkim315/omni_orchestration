@@ -48,7 +48,7 @@ type WakeResponse struct {
 type CoordinatorRuntime struct {
 	rt      *runtime.Runtime
 	mu      sync.Mutex
-	gen     int64
+	gen     atomic.Int64 // C4: atomic for generation gating
 	id      string
 	ackSeq  int64 // monotonic ACK sequence
 	timeout time.Duration
@@ -72,14 +72,13 @@ func (c *CoordinatorRuntime) ID() string { return c.id }
 
 // Generation returns the current coordinator generation.
 func (c *CoordinatorRuntime) Generation() int64 {
-	return atomic.LoadInt64(&c.gen)
+	return c.gen.Load()
 }
 
 // SetTimeout overrides the default 120s wake timeout.
 func (c *CoordinatorRuntime) SetTimeout(d time.Duration) {
 	c.mu.Lock()
 	c.timeout = d
-	c.mu.Unlock()
 }
 
 // Wake sends a packet to the coordinator and waits for a validated decision.
@@ -87,9 +86,7 @@ func (c *CoordinatorRuntime) SetTimeout(d time.Duration) {
 // Malformed responses return ErrMalformedResponse. A coordinator that does
 // not respond within the timeout returns ErrCoordinatorTimeout.
 func (c *CoordinatorRuntime) Wake(ctx context.Context, generation int64, pkt WakePacket) (WakeResponse, error) {
-	c.mu.Lock()
-	if generation != c.gen {
-		c.mu.Unlock()
+	if generation != c.gen.Load() {
 		return WakeResponse{}, ErrStaleCoordinator
 	}
 
@@ -109,7 +106,6 @@ func (c *CoordinatorRuntime) Wake(ctx context.Context, generation int64, pkt Wak
 	// Input ACK: assign a monotonic sequence number.
 	seq := atomic.AddInt64(&c.ackSeq, 1)
 	snapshotGen := generation // capture at call time
-	c.mu.Unlock()
 	_ = seq
 
 	// Call the coordinator with timeout.
@@ -125,7 +121,7 @@ func (c *CoordinatorRuntime) Wake(ctx context.Context, generation int64, pkt Wak
 	}
 
 	// C4: reject if generation changed during Decide (old-gen response).
-	if atomic.LoadInt64(&c.gen) != snapshotGen {
+	if c.gen.Load() != snapshotGen {
 		return WakeResponse{}, ErrStaleCoordinator
 	}
 
@@ -152,13 +148,12 @@ func (c *CoordinatorRuntime) Wake(ctx context.Context, generation int64, pkt Wak
 // new generation for subsequent Wake calls.
 func (c *CoordinatorRuntime) Replace(ctx context.Context, newRT *runtime.Runtime) *CoordinatorRuntime {
 	c.mu.Lock()
-	oldGen := c.gen
+	oldGen := c.gen.Load()
 	c.rt.Stop(ctx)
 	c.rt = newRT
 	c.id = newRT.ID()
-	c.gen = oldGen + 1
-	newGen := c.gen
-	c.mu.Unlock()
+	c.gen.Store(oldGen + 1)
+	newGen := c.gen.Load()
 
 	_ = newGen
 	return c

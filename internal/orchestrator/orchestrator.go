@@ -139,7 +139,7 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 	// Never kill owner processes; only cancel stale DB records.
 	existing, _ := store.GetActiveAttempts()
 	for _, a := range existing {
-		if a.Branch != "" && !worktreeExists(a.Branch) {
+		if a.Branch != "" && !worktreeExists(cfg.Repo, a.Branch) {
 			log.Printf("C5 recovery: attempt %d branch %q worktree gone — cancelling", a.ID, a.Branch)
 			store.UpdateAttemptStatus(a.ID, taskstore.StatusCancelled)
 		} else {
@@ -476,11 +476,9 @@ func isWithinWorktree(cwd, wtPath string) bool {
 	return !strings.HasPrefix(rel, "..") && rel != "."
 }
 
-func worktreeExists(branch string) bool {
-	// Worktree branches are stored under .worktrees/ in the repo parent.
-	// A simple check: the branch name contains the worktree path info.
-	// For now, verify via git worktree list.
-	cmd := exec.Command("git", "worktree", "list", "--porcelain")
+func worktreeExists(repoPath, branch string) bool {
+	// C5: use cfg.Repo as git worktree list target, not process CWD.
+	cmd := exec.Command("git", "-C", repoPath, "worktree", "list", "--porcelain")
 	out, err := cmd.Output()
 	if err != nil {
 		return false
