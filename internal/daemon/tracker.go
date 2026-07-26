@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -144,12 +145,24 @@ func (t *Tracker) poll(ctx context.Context) {
 			continue
 		}
 
-		// v3.0.1: Persistent path leases via DAG store (not in-memory).
-		taskPaths := taskOwnedPaths(task)
+		// v3.0.5: Path leases from stored task.OwnedPaths. Check error.
+		taskPaths := strings.Split(task.OwnedPaths, ",")
+		if len(taskPaths) == 1 && taskPaths[0] == "" {
+			taskPaths = nil
+		}
 		acquiredAll := true
 		for _, p := range taskPaths {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
 			ok, err := t.dagStore.AcquirePathLease(task.ID, p)
-			if err != nil || !ok {
+			if err != nil {
+				log.Printf("tracker: task %d path %s error: %v", task.ID, p, err)
+				acquiredAll = false
+				break
+			}
+			if !ok {
 				log.Printf("tracker: task %d path %s conflict — waiting", task.ID, p)
 				acquiredAll = false
 				break

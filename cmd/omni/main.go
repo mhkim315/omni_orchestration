@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/mhkim315/omni_orchestration/internal/coordinator"
@@ -580,11 +581,17 @@ func fleetCmd(args []string) error {
 				dependsOnIDs = append(dependsOnIDs, depID)
 			}
 		}
-		dt, err := dagStore.CreateTaskMultiDep(1, t.Title, dependsOnIDs, taskRepo)
+		dt, err := dagStore.CreateTaskFull(1, t.Title, 0, taskRepo, t.Command, t.Validator, strings.Join(t.OwnedPaths, ","))
 		if err != nil {
 			return fmt.Errorf("create task %d: %w", i+1, err)
 		}
 		taskIDs[i+1] = dt.ID
+		for _, depID := range dependsOnIDs {
+			dagStore.AddDependency(dt.ID, depID)
+		}
+		if len(dependsOnIDs) > 0 {
+			dagStore.UpdateTaskStatus(dt.ID, dag.StatusBlocked)
+		}
 		// Acquire path leases.
 		for _, p := range t.OwnedPaths {
 			dagStore.AcquirePathLease(dt.ID, p)
