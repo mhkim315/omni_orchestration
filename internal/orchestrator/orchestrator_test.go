@@ -318,6 +318,66 @@ exit 0
 	os.Remove("/tmp/omni-fake-agy-calls")
 }
 
+// TestBlackBoxReasonixCoordinator validates the Reasonix provider.
+func TestBlackBoxReasonixCoordinator(t *testing.T) {
+	fakeDir, err := os.MkdirTemp("", "omni-fake-reasonix-*")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(fakeDir)
+
+	fakePath := filepath.Join(fakeDir, "reasonix")
+	fakeScript := `#!/bin/bash
+CALL_FILE="/tmp/omni-fake-reasonix-calls"
+CALL_COUNT=1
+if [ -f "$CALL_FILE" ]; then CALL_COUNT=$(($(cat "$CALL_FILE") + 1)); fi
+echo "$CALL_COUNT" > "$CALL_FILE"
+case $CALL_COUNT in
+	1) echo '{"decision":"VALIDATE","reason":"start","next_instruction":"write test file"}' ;;
+	2) echo '{"decision":"COMPLETE","reason":"validator passed","next_instruction":""}' ;;
+	*) echo '{"decision":"FAIL","reason":"too many calls","next_instruction":""}' ;;
+esac
+exit 0
+`
+	os.WriteFile(fakePath, []byte(fakeScript), 0755)
+
+	repoDir, _ := os.MkdirTemp("", "omni-reasonix-e2e-*")
+	defer os.RemoveAll(repoDir)
+	runGit(t, repoDir, "init")
+	runGit(t, repoDir, "config", "user.email", "e2e@o")
+	runGit(t, repoDir, "config", "user.name", "T")
+	os.WriteFile(filepath.Join(repoDir, "R.md"), []byte("# T"), 0644)
+	runGit(t, repoDir, "add", "R.md")
+	runGit(t, repoDir, "commit", "-m", "init")
+
+	store, _ := taskstore.NewInMemory()
+	defer store.Close()
+
+	rc := coordinator.NewReasonixCoordinator()
+	rc.Bin = fakePath
+	rt := runtime.NewWithID("coordinator-reasonix", 1)
+	cr := coordinator.NewCoordinatorRuntime(rt, rc)
+
+	cfg := Config{
+		Repo: repoDir, Task: "write test", Command: "echo 'hello from worker' > output.txt",
+		CWD: "", Validator: "grep -q 'hello from worker' output.txt", MaxAttempts: 2,
+		Coordinator: cr,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	decisions, err := Run(ctx, cfg, store, worktree.New())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	t.Logf("reasonix decisions: %v", decisions)
+	if decisions[len(decisions)-1] != DecisionComplete {
+		t.Errorf("final = %s, want COMPLETE", decisions[len(decisions)-1])
+	}
+	os.Remove("/tmp/omni-fake-reasonix-calls")
+}
+
 // ── Helpers ──
 
 func runGit(t *testing.T, dir string, args ...string) {

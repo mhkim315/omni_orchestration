@@ -592,6 +592,29 @@ func (s *Store) RecordAttemptOutcome(runID int64, attemptNum int, validatorPasse
 	return err
 }
 
+// StatsFor returns aggregate provider stats (R2 Fix 1: local type, no coordinator import).
+func (s *Store) StatsFor(provider string) ProviderStatsRow {
+	var total, successes, rejects int
+	var totalMs int64
+	row := s.db.QueryRow(
+		"SELECT COUNT(*), COALESCE(SUM(CASE WHEN final_adopted_attempt>0 THEN 1 ELSE 0 END),0), COALESCE(SUM(validator_reject_count),0), COALESCE(SUM(duration_ms),0) FROM run_records WHERE provider=?",
+		provider,
+	)
+	row.Scan(&total, &successes, &rejects, &totalMs)
+	return ProviderStatsRow{
+		TotalAttempts: total, Successes: successes,
+		TotalRejects: rejects, TotalTimeMs: totalMs,
+	}
+}
+
+// ProviderStatsRow holds aggregate provider stats.
+type ProviderStatsRow struct {
+	TotalAttempts int
+	Successes     int
+	TotalRejects  int
+	TotalTimeMs   int64
+}
+
 // RecordAdoption marks the final adopted attempt for a run.
 func (s *Store) RecordAdoption(runID int64, attemptNum int, adopted bool) error {
 	s.mu.Lock()

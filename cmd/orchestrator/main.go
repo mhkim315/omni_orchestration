@@ -87,6 +87,7 @@ func run() error {
 	}
 
 	if *coordFlag == "auto" {
+		// R2: SQLite-backed router using persisted stats.
 		router := coordinator.NewRouter(nil)
 		selected := router.SelectCoordinator(*task, *repo, *modelFlag, *effortFlag)
 		log.Printf("Router: selected %s for task %q (model=%s effort=%s)", selected, *task, *modelFlag, *effortFlag)
@@ -95,7 +96,8 @@ func run() error {
 	if *coordFlag != "" {
 		coord, err := makeCoordinator(*coordFlag, *modelFlag, *effortFlag)
 		if err != nil {
-			log.Printf("Coordinator: %v — falling back to auto-VALIDATE", err)
+			// R2: explicit fail-closed — no silent VALIDATE fallback.
+			return fmt.Errorf("coordinator %q unavailable: %w", *coordFlag, err)
 		} else if coord != nil {
 			rt := runtime.NewWithID("coordinator-"+*coordFlag, 1)
 			cfg.Coordinator = coordinator.NewCoordinatorRuntime(rt, coord)
