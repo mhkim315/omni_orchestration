@@ -20,6 +20,7 @@ import (
 	"github.com/mhkim315/omni_orchestration/internal/coordinator"
 	"github.com/mhkim315/omni_orchestration/internal/dag"
 	"github.com/mhkim315/omni_orchestration/internal/mailbox"
+	"github.com/mhkim315/omni_orchestration/internal/policy"
 	"github.com/mhkim315/omni_orchestration/internal/runtime"
 	"github.com/mhkim315/omni_orchestration/internal/supervisor"
 	"github.com/mhkim315/omni_orchestration/internal/taskstore"
@@ -61,6 +62,9 @@ type Config struct {
 
 	// v1.3: Sequential task DAG for dependency-based orchestration.
 	DAGStore *dag.Store
+
+	// v1.4: Capability policy enforcement.
+	PolicyRegistry *policy.Registry
 
 	// B-R1: Coordinator runtime for LLM-driven decisions.
 	Coordinator *coordinator.CoordinatorRuntime
@@ -389,6 +393,14 @@ func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instructi
 	if err != nil {
 		rc.wt.Remove(info.Path)
 		return nil, fmt.Errorf("create attempt: %w", err)
+	}
+
+	// v1.4: Enforce capability policy before worker creation.
+	if rc.cfg.PolicyRegistry != nil && rc.cfg.Provider != "" {
+		if err := rc.cfg.PolicyRegistry.CheckProvider(rc.cfg.Provider); err != nil {
+			rc.wt.Remove(info.Path)
+			return nil, fmt.Errorf("policy reject: %w", err)
+		}
 	}
 
 	rt := runtime.New()
