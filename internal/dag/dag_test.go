@@ -45,6 +45,7 @@ func TestChainUnlock(t *testing.T) {
 	}
 
 	// Complete t1 → unblocks t2.
+	s.UpdateTaskStatus(t1.ID, StatusCompleted)
 	n, err := s.UnblockDependents(t1.ID)
 	if err != nil {
 		t.Fatalf("UnblockDependents t1: %v", err)
@@ -58,16 +59,18 @@ func TestChainUnlock(t *testing.T) {
 	}
 
 	// Complete t2 → unblocks t3.
-	s.UnblockDependents(t2.ID)
+	s.UpdateTaskStatus(t2.ID, StatusCompleted)
+	n2, _ := s.UnblockDependents(t2.ID)
+	_ = n2
 	t3after, _ := s.GetTask(t3.ID)
 	if t3after.Status != StatusPending {
 		t.Errorf("t3 status after unblock = %s, want pending", t3after.Status)
 	}
 
-	// t1 still pending (unchanged).
+	// t1 was completed to trigger unblock.
 	t1after, _ := s.GetTask(t1.ID)
-	if t1after.Status != StatusPending {
-		t.Errorf("t1 status after = %s, want pending (unchanged)", t1after.Status)
+	if t1after.Status != StatusCompleted {
+		t.Errorf("t1 status after = %s, want completed", t1after.Status)
 	}
 }
 
@@ -162,6 +165,7 @@ func TestRestartResume(t *testing.T) {
 	}
 
 	// Unblock still works after restart.
+	s2.UpdateTaskStatus(t1.ID, StatusCompleted)
 	s2.UnblockDependents(t1.ID)
 	tt2after, _ := s2.GetTask(t2.ID)
 	if tt2after.Status != StatusPending {
@@ -255,25 +259,25 @@ func TestMultiParentJoin(t *testing.T) {
 	s.AddDependency(d.ID, b.ID)
 	s.AddDependency(d.ID, c.ID)
 
-	// Complete B only → D still blocked.
+	// Complete B only → D stays blocked (C not done).
 	s.UpdateTaskStatus(b.ID, StatusCompleted)
 	s.UpdateTaskStatus(d.ID, StatusBlocked)
-	unblocked, _ := s.UnblockIfReady(d.ID)
-	if unblocked {
-		t.Error("D unblocked before C completed")
+	s.UnblockDependents(b.ID) // NOT EXISTS: C not done → D stays blocked
+	if dAfter, _ := s.GetTask(d.ID); dAfter.Status != StatusBlocked {
+		t.Errorf("D = %s after B, want blocked (C not done)", dAfter.Status)
 	}
 
-	// Complete C → D unblocks (both parents done).
+	// Complete C → both parents done → UnblockDependents unlocks D.
 	s.UpdateTaskStatus(c.ID, StatusCompleted)
-	unblocked2, _ := s.UnblockIfReady(d.ID)
-	if !unblocked2 {
-		t.Errorf("D not unblocked after both parents completed. D status check")
+	n, _ := s.UnblockDependents(c.ID)
+	if n != 1 {
+		t.Errorf("UnblockDependents unblocked %d, want 1 (D)", n)
 	}
 	dFinal, _ := s.GetTask(d.ID)
-	t.Logf("fan-in: B + C → D. D final=%s (want pending)", dFinal.Status)
 	if dFinal.Status != StatusPending {
 		t.Errorf("D final = %s, want pending", dFinal.Status)
 	}
+	t.Logf("fan-in: B + C → D. D=%s ✓", dFinal.Status)
 }
 
 // 9. Tracker real command proof — CreateTaskFull stores command + validator

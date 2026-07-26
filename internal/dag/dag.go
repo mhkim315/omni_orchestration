@@ -389,19 +389,35 @@ func (s *Store) GetTasksByRun(runID int64) ([]*Task, error) {
 func (s *Store) UnblockDependents(completedTaskID int64) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// v3.0.5: Unblock children via task_dependencies where this task is a parent.
-	// For multi-parent fan-in, callers should also call UnblockIfReady.
-	res, err := s.db.Exec(
-		`UPDATE dag_tasks SET status=? WHERE id IN (
-			SELECT task_id FROM task_dependencies WHERE depends_on_task_id=?
-		) AND status=?`,
-		StatusPending, completedTaskID, StatusBlocked,
+	// v3.0.5 FINAL: Unblock children via task_dependencies where this parent
+	// completed. Then check ALL parents via UnblockIfReady for each child.
+	// Simple query first, multi-parent safety via per-child check.
+	rows, qErr := s.db.Query(
+		`SELECT DISTINCT task_id FROM task_dependencies WHERE depends_on_task_id=?`,
+		completedTaskID,
 	)
-	if err != nil {
-		return 0, err
+	if qErr != nil {
+		return 0, qErr
 	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+	var childIDs []int64
+	for rows.Next() {
+		var cid int64
+		rows.Scan(&cid)
+		childIDs = append(childIDs, cid)
+	}
+	rows.Close()
+	// Release lock before per-child UnblockIfReady (which locks independently).
+	s.mu.Unlock()
+	var unblocked int
+	for _, cid := range childIDs {
+		// Only unblock if ALL parents completed (fan-in safety).
+		ok, _ := s.UnblockIfReady(cid)
+		if ok {
+			unblocked++
+		}
+	}
+	s.mu.Lock()
+	return unblocked, nil
 }
 
 // DetectCircular checks if adding a dependency from 'from' to 'to' would create a cycle.
