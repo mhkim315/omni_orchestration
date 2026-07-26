@@ -21,6 +21,7 @@ import (
 	"syscall"
 
 	"github.com/mhkim315/omni_orchestration/internal/coordinator"
+	"github.com/mhkim315/omni_orchestration/internal/daemon"
 	"github.com/mhkim315/omni_orchestration/internal/orchestrator"
 	"github.com/mhkim315/omni_orchestration/internal/runtime"
 	"github.com/mhkim315/omni_orchestration/internal/taskstore"
@@ -56,6 +57,9 @@ func run() error {
 	}
 	if os.Args[1] == "result" {
 		return resultCmd(os.Args[2:])
+	}
+	if os.Args[1] == "fleet" {
+		return fleetCmd(os.Args[2:])
 	}
 	if os.Args[1] != "run" {
 		fmt.Fprintf(os.Stderr, "Usage: orchestrator run --task <title> --command <cmd> --repo <path> [--resume] [--coordinator codex|claude|agy|reasonix|auto] [--model <name>] [--effort low|medium|high] [--validator <cmd>] [--store <path>]\n")
@@ -485,4 +489,59 @@ func parseID(s string) (int64, error) {
 		return 0, fmt.Errorf("invalid ID: %s", s)
 	}
 	return id, nil
+}
+
+// ── Fleet subcommand (v2.0.1) ──
+
+func fleetCmd(args []string) error {
+	planFile := ""
+	repo := ""
+	maxWorkers := 2
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--plan":
+			if i+1 < len(args) {
+				planFile = args[i+1]
+				i++
+			}
+		case "--repo":
+			if i+1 < len(args) {
+				repo = args[i+1]
+				i++
+			}
+		case "--max-workers":
+			if i+1 < len(args) {
+				fmt.Sscanf(args[i+1], "%d", &maxWorkers)
+				i++
+			}
+		}
+	}
+	if planFile == "" || repo == "" {
+		return fmt.Errorf("usage: omni fleet run --plan <file> --repo <dir> [--max-workers 2]")
+	}
+	log.Printf("fleet: plan=%s repo=%s workers=%d", planFile, repo, maxWorkers)
+
+	// Initialize daemon with DAG.
+	storePath := filepath.Join(os.TempDir(), "omni-fleet.db")
+	dagPath := filepath.Join(os.TempDir(), "omni-fleet-dag.db")
+	cfg := daemon.Config{
+		StorePath: storePath,
+		DAGPath:   dagPath,
+		RepoBase:  repo,
+	}
+	d, err := daemon.New(cfg)
+	if err != nil {
+		return fmt.Errorf("fleet daemon: %w", err)
+	}
+	defer d.Store().Close()
+
+	// Start daemon with fleet tracker.
+	if err := d.Start(); err != nil {
+		return err
+	}
+	log.Printf("fleet: daemon started with %d workers", maxWorkers)
+
+	// Block until signal.
+	daemon.WaitForSignal(d)
+	return nil
 }

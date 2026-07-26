@@ -89,6 +89,52 @@ func NewInMemory() (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// ── Path Authority (v2.0.1) ──
+
+// PathLease records exclusive ownership of a file path by a task.
+type PathLease struct {
+	ID     int64
+	TaskID int64
+	Path   string
+}
+
+// AcquirePathLease claims a path for a task. Returns false if already owned by another task.
+func (s *Store) AcquirePathLease(taskID int64, path string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Check existing owner.
+	var owner int64
+	err := s.db.QueryRow("SELECT task_id FROM path_leases WHERE path=?", path).Scan(&owner)
+	if err == nil && owner != taskID {
+		return false, nil // owned by another task
+	}
+	_, err = s.db.Exec("INSERT OR IGNORE INTO path_leases (task_id, path) VALUES (?,?)", taskID, path)
+	return err == nil, err
+}
+
+// ReleasePathLeases frees all paths owned by a task.
+func (s *Store) ReleasePathLeases(taskID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec("DELETE FROM path_leases WHERE task_id=?", taskID)
+	return err
+}
+
+// CheckPathOverlap returns tasks that overlap on the given paths.
+func (s *Store) CheckPathOverlap(paths []string) ([]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Build IN clause manually
+	var owners []int64
+	for _, p := range paths {
+		var owner int64
+		if err := s.db.QueryRow("SELECT task_id FROM path_leases WHERE path=?", p).Scan(&owner); err == nil {
+			owners = append(owners, owner)
+		}
+	}
+	return owners, nil
+}
+
 func (s *Store) migrate() error {
 	ddl := `
 	CREATE TABLE IF NOT EXISTS dag_tasks (
@@ -101,6 +147,19 @@ func (s *Store) migrate() error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_dag_tasks_status ON dag_tasks(status);
 	CREATE INDEX IF NOT EXISTS idx_dag_tasks_depends ON dag_tasks(depends_on_task_id);
+	CREATE TABLE IF NOT EXISTS task_dependencies (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id INTEGER NOT NULL,
+		depends_on_task_id INTEGER NOT NULL,
+		UNIQUE(task_id, depends_on_task_id)
+	);
+	CREATE INDEX IF NOT EXISTS idx_task_deps_task ON task_dependencies(task_id);
+	CREATE INDEX IF NOT EXISTS idx_task_deps_depends ON task_dependencies(depends_on_task_id);
+	CREATE TABLE IF NOT EXISTS path_leases (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		task_id INTEGER NOT NULL,
+		path TEXT NOT NULL UNIQUE
+	);
 	`
 	_, err := s.db.Exec(ddl)
 	return err
@@ -165,6 +224,79 @@ func (s *Store) getTask(id int64) (*Task, error) {
 
 // UnblockTask transitions a blocked task to pending when its dependency completes.
 // Only transitions from blocked→pending. Idempotent for other states.
+// AddDependency adds a dependency edge between two tasks.
+func (s *Store) AddDependency(taskID, dependsOnTaskID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		"INSERT OR IGNORE INTO task_dependencies (task_id, depends_on_task_id) VALUES (?,?)",
+		taskID, dependsOnTaskID,
+	)
+	return err
+}
+
+// GetDependencies returns the list of task IDs that the given task depends on.
+func (s *Store) GetDependencies(taskID int64) ([]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query("SELECT depends_on_task_id FROM task_dependencies WHERE task_id=?", taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var deps []int64
+	for rows.Next() {
+		var d int64
+		rows.Scan(&d)
+		deps = append(deps, d)
+	}
+	return deps, rows.Err()
+}
+
+// AllParentsComplete returns true if all dependencies of a task are completed.
+func (s *Store) AllParentsComplete(taskID int64) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var pending int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM task_dependencies td
+		 JOIN dag_tasks dt ON td.depends_on_task_id = dt.id
+		 WHERE td.task_id=? AND dt.status NOT IN (?,?)`,
+		taskID, StatusCompleted, StatusFailed,
+	).Scan(&pending)
+	if err != nil {
+		return false, err
+	}
+	return pending == 0, nil
+}
+
+// UnblockIfReady checks all parents and unblocks the task if they're complete.
+func (s *Store) UnblockIfReady(taskID int64) (bool, error) {
+	allDone, err := s.AllParentsComplete(taskID)
+	if err != nil || !allDone {
+		return false, err
+	}
+	// Check if any parent failed — if so, don't unblock.
+	var failures int
+	s.db.QueryRow(
+		`SELECT COUNT(*) FROM task_dependencies td
+		 JOIN dag_tasks dt ON td.depends_on_task_id = dt.id
+		 WHERE td.task_id=? AND dt.status=?`,
+		taskID, StatusFailed,
+	).Scan(&failures)
+	if failures > 0 {
+		// Fan-in failure: if any parent fails, block child permanently.
+		s.db.Exec("UPDATE dag_tasks SET status=? WHERE id=? AND status=?", StatusFailed, taskID, StatusBlocked)
+		return false, nil
+	}
+	res, err := s.db.Exec("UPDATE dag_tasks SET status=? WHERE id=? AND status=?", StatusPending, taskID, StatusBlocked)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
 func (s *Store) UnblockTask(id int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
