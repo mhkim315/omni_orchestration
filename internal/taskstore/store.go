@@ -570,7 +570,7 @@ func (s *Store) RecordRun(runID int64, provider, model, role, taskCategory, repo
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(
-		`INSERT INTO run_records (run_id, provider, model, role, task_category, repo)
+		`INSERT OR IGNORE INTO run_records (run_id, provider, model, role, task_category, repo)
 		 VALUES (?,?,?,?,?,?)`,
 		runID, provider, model, role, taskCategory, repo,
 	)

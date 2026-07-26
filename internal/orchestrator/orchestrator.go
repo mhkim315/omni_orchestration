@@ -281,7 +281,7 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		})
 		if err != nil {
 			log.Printf("B-R1: coordinator wake failed: %v — FAIL (R3: fail-closed)", err)
-			resp = coordinator.WakeResponse{Decision: DecisionRetryClean, Reason: "wake failed", NextInstruction: cfg.Task}
+			resp = coordinator.WakeResponse{Decision: DecisionFail, Reason: "wake failed", NextInstruction: cfg.Task}
 		}
 		// C2: no-coordinator flow — validator PASS → auto-COMPLETE.
 		if rc.cfg.Coordinator == nil && result.validatorPassed {

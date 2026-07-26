@@ -272,10 +272,10 @@ func resultShow(store *taskstore.Store, target string) error {
 	fmt.Printf("Task: %s\n", task.Title)
 	if rec != nil {
 		fmt.Printf("Provider: %s  Model: %s  Role: %s\n", rec.Provider, rec.Model, rec.Role)
-		fmt.Printf("Duration: %dms  Attempts: %d  Rejects: %d  Adopted: %d\n",
+		fmt.Printf("Duration: %dms  Atattempts: %d  Rejects: %d  Adopted: %d\n",
 			rec.DurationMs, rec.AttemptCount, rec.ValidatorRejectCount, rec.FinalAdoptedAttempt)
 	}
-	fmt.Printf("\nAttempts:\n")
+	fmt.Printf("\nAtattempts:\n")
 	for _, a := range attempts {
 		adopted := ""
 		if rec != nil && rec.FinalAdoptedAttempt == a.Number {
@@ -326,25 +326,53 @@ func resultAdopt(store *taskstore.Store, target string) error {
 		return err
 	}
 
+	// R3: parse --attempt flag.
+	attemptNum := 0
+	for i, a := range os.Args {
+		if a == "--attempt" && i+1 < len(os.Args) {
+			fmt.Sscanf(os.Args[i+1], "%d", &attemptNum)
+		}
+	}
+
 	tasks, _ := store.GetTasksByRun(runID)
 	if len(tasks) == 0 {
 		return fmt.Errorf("no tasks")
 	}
 	attempts, _ := store.GetAttemptsByTask(tasks[0].ID)
-
 	if len(attempts) == 0 {
 		return fmt.Errorf("no attempts")
 	}
-	last := attempts[len(attempts)-1]
 
-	// P0-2: verify run_record exists before adoption.
+	var chosen *taskstore.Attempt
+	if attemptNum > 0 {
+		for _, a := range attempts {
+			if a.Number == attemptNum {
+				chosen = a
+				break
+			}
+		}
+		if chosen == nil {
+			return fmt.Errorf("attempt %d not found in run %d", attemptNum, runID)
+		}
+	} else {
+		chosen = attempts[len(attempts)-1]
+	}
+
+	// R3: verify completed + checkpoint before adopt.
+	if chosen.Status != taskstore.StatusCompleted {
+		return fmt.Errorf("attempt %d is %s — must be completed before adopt", chosen.Number, chosen.Status)
+	}
+	if chosen.CheckpointCommit == "" {
+		return fmt.Errorf("attempt %d has no checkpoint", chosen.Number)
+	}
+
 	if _, err := store.GetRunRecord(runID); err != nil {
 		return fmt.Errorf("no run_record for run %d: %w", runID, err)
 	}
-	if err := store.RecordAdoption(runID, last.Number, true); err != nil {
+	if err := store.RecordAdoption(runID, chosen.Number, true); err != nil {
 		return fmt.Errorf("adopt: %w", err)
 	}
-	fmt.Printf("Run #%d — Attempt #%d adopted ✓\n", runID, last.Number)
+	fmt.Printf("Run #%d — Attempt #%d adopted \u2713\n", runID, chosen.Number)
 	return nil
 }
 
