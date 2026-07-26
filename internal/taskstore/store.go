@@ -211,7 +211,17 @@ func (s *Store) migrate() error {
 		event_id INTEGER NOT NULL UNIQUE REFERENCES events(id),
 		acked_at TEXT NOT NULL DEFAULT (datetime('now'))
 	);
-	CREATE TABLE IF NOT EXISTS effect_keys (
+	CREATE TABLE IF NOT EXISTS tombstones (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id INTEGER NOT NULL,
+			action TEXT NOT NULL,
+			run_epoch INTEGER NOT NULL DEFAULT 1,
+			task_gen INTEGER NOT NULL DEFAULT 1,
+			attempt_gen INTEGER NOT NULL DEFAULT 1,
+			worker_lease_gen INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE TABLE IF NOT EXISTS effect_keys (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		run_id INTEGER NOT NULL,
 		effect_key TEXT NOT NULL,
@@ -708,6 +718,19 @@ func (s *Store) RecordEffect(runID int64, key string) (bool, error) {
 
 // HasEffect returns true if the effect key has already been recorded for the run.
 // R2 Fix 4: Decision Gateway durable effect keys in SQLite.
+// RecordTombstone writes a durable intent record before a destructive action.
+// v1.5: Integration authority — tombstone before kill/signal.
+func (s *Store) RecordTombstone(runID int64, action string, runEpoch, taskGen, attemptGen, workerLeaseGen int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(
+		"INSERT INTO tombstones (run_id, action, run_epoch, task_gen, attempt_gen, worker_lease_gen) VALUES (?,?,?,?,?,?)",
+		runID, action, runEpoch, taskGen, attemptGen, workerLeaseGen,
+	)
+	return err
+}
+
+// HasEffect returns true if the effect key has already been recorded for the run.
 func (s *Store) HasEffect(runID int64, key string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

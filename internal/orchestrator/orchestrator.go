@@ -403,6 +403,18 @@ func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instructi
 		}
 	}
 
+	// v1.5: Validate authority before worker creation.
+	if auth, err := CurrentAuthority(rc.store, rc.runID, rc.taskID); err == nil {
+		intent := &Authority{
+			RunEpoch: auth.RunEpoch, TaskGeneration: auth.TaskGeneration,
+			AttemptGeneration: int64(num), WorkerLeaseGeneration: 1,
+		}
+		if err := intent.ValidateMutation(auth); err != nil {
+			rc.wt.Remove(info.Path)
+			return nil, fmt.Errorf("authority reject: %w", err)
+		}
+	}
+
 	rt := runtime.New()
 	if err := rt.Start(rc.cfg.Command, cwd); err != nil {
 		rc.wt.Remove(info.Path)
@@ -602,10 +614,18 @@ func (rc *runContext) allowedDecisions(result observeResult) []string {
 	}
 }
 
+// v1.5: Record tombstone before destructive action.
+func (rc *runContext) tombstoneBeforeKill(action string) {
+	auth, _ := CurrentAuthority(rc.store, rc.runID, rc.taskID)
+	RecordTombstone(rc.store, rc.runID, action, auth)
+}
+
 // finalizeTerminal closes worker runtimes and updates run/task status.
 // Each attempt keeps its own terminal status (not overwritten).
 // Only non-terminal workers are closed.
 func (rc *runContext) finalizeTerminal(ast *attemptState, status string) {
+	// v1.5: Durable tombstone before kill.
+	rc.tombstoneBeforeKill(fmt.Sprintf("finalizeTerminal:%s", status))
 	// Close only non-terminal workers in tracked attempts.
 	for _, a := range rc.attempts {
 		if a.rt != nil {
