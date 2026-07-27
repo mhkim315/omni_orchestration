@@ -642,7 +642,17 @@ func fleetCmd(args []string) error {
 			}
 			if allTerminal {
 				tracker.Close()
-				log.Printf("fleet: all %d tasks terminal — stopping", len(taskIDs))
+				failed := 0
+				for _, tid := range taskIDs {
+					dt, _ := dagStore.GetTask(tid)
+					if dt.Status == dag.StatusFailed {
+						failed++
+					}
+				}
+				log.Printf("fleet: all %d tasks terminal (%d failed)", len(taskIDs), failed)
+				if failed > 0 {
+					return fmt.Errorf("fleet: %d/%d tasks failed", failed, len(taskIDs))
+				}
 				return nil
 			}
 		}

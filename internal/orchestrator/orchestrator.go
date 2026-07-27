@@ -185,19 +185,30 @@ func Run(ctx context.Context, cfg Config, store *taskstore.Store, wt *worktree.M
 		}
 	}
 
-	run, err := store.CreateRun()
-	if err != nil {
-		return nil, fmt.Errorf("create run: %w", err)
+	var run *taskstore.Run
+	var task *taskstore.Task
+	var err error
+	// v3.0.7: Use pre-created IDs from tracker if set.
+	if cfg.RunID != 0 {
+		run, _ = store.GetRun(cfg.RunID)
+		task, _ = store.GetTask(cfg.TaskID)
 	}
-	// R2: Record run for provider stats (if provider is known).
-	if cfg.Provider != "" {
+	if run == nil {
+		run, err = store.CreateRun()
+		if err != nil {
+			return nil, fmt.Errorf("create run: %w", err)
+		}
+	}
+	if cfg.Provider != "" && cfg.RunID == 0 {
 		if err := store.RecordRun(run.ID, cfg.Provider, cfg.Model, "coordinator", cfg.Task, cfg.Repo); err != nil {
 			log.Printf("R2: RecordRun failed: %v", err)
 		}
 	}
-	task, err := store.CreateTask(run.ID, cfg.Task)
-	if err != nil {
-		return nil, fmt.Errorf("create task: %w", err)
+	if task == nil {
+		task, err = store.CreateTask(run.ID, cfg.Task)
+		if err != nil {
+			return nil, fmt.Errorf("create task: %w", err)
+		}
 	}
 
 	rc := &runContext{
@@ -394,10 +405,18 @@ func (rc *runContext) createAttempt(taskID int64, num int, baseCommit, instructi
 		rc.wt.Remove(info.Path)
 		return nil, fmt.Errorf("CWD %q is outside worktree %q", cwd, info.Path)
 	}
-	attempt, err := rc.store.CreateAttempt(taskID, num, attemptID, info.Branch, baseCommit)
-	if err != nil {
-		rc.wt.Remove(info.Path)
-		return nil, fmt.Errorf("create attempt: %w", err)
+	var attempt *taskstore.Attempt
+	// v3.0.7: Use pre-created attempt from tracker if set.
+	if rc.cfg.AttemptID != 0 {
+		attempt, _ = rc.store.GetAttempt(rc.cfg.AttemptID)
+	}
+	if attempt == nil {
+		var err error
+		attempt, err = rc.store.CreateAttempt(taskID, num, attemptID, info.Branch, baseCommit)
+		if err != nil {
+			rc.wt.Remove(info.Path)
+			return nil, fmt.Errorf("create attempt: %w", err)
+		}
 	}
 
 	// v1.4: Enforce capability policy before worker creation.
