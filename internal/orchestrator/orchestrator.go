@@ -53,6 +53,11 @@ type Config struct {
 	StorePath   string
 	MaxAttempts int
 
+	// v3.0.6: Pre-created IDs from tracker (skip CreateRun/CreateTask/CreateAttempt).
+	RunID     int64
+	TaskID    int64
+	AttemptID int64
+
 	// R2: Provider identity for stats recording.
 	Provider string
 	Model    string

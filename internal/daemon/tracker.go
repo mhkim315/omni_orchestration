@@ -150,6 +150,7 @@ func (t *Tracker) poll(ctx context.Context) {
 		if len(taskPaths) == 1 && taskPaths[0] == "" {
 			taskPaths = nil
 		}
+		var acquired []string
 		acquiredAll := true
 		for _, p := range taskPaths {
 			p = strings.TrimSpace(p)
@@ -157,18 +158,23 @@ func (t *Tracker) poll(ctx context.Context) {
 				continue
 			}
 			ok, err := t.dagStore.AcquirePathLease(task.ID, p)
-			if err != nil {
-				log.Printf("tracker: task %d path %s error: %v", task.ID, p, err)
+			if err != nil || !ok {
+				if err != nil {
+					log.Printf("tracker: task %d path %s error: %v", task.ID, p, err)
+				} else {
+					log.Printf("tracker: task %d path %s conflict — waiting", task.ID, p)
+				}
 				acquiredAll = false
 				break
 			}
-			if !ok {
-				log.Printf("tracker: task %d path %s conflict — waiting", task.ID, p)
-				acquiredAll = false
-				break
-			}
+			acquired = append(acquired, p)
 		}
 		if !acquiredAll {
+			// Release any paths we did acquire before the failure.
+			for _, p := range acquired {
+				t.dagStore.ReleasePathLeases(task.ID)
+				_ = p
+			}
 			continue
 		}
 
@@ -198,6 +204,9 @@ func (t *Tracker) executeTask(ctx context.Context, task *dag.Task) {
 	if task.Repo != "" {
 		cfg.Repo = task.Repo
 	}
+	if task.Validator != "" {
+		cfg.Validator = task.Validator
+	}
 
 	go func() {
 		defer func() {
@@ -216,8 +225,10 @@ func (t *Tracker) executeTask(ctx context.Context, task *dag.Task) {
 			t.dagStore.UpdateTaskStatus(task.ID, dag.StatusFailed)
 			return
 		}
-		_ = attempt
 		t.dagStore.UpdateTaskStatus(task.ID, dag.StatusActive)
+		cfg.RunID = run.ID
+		cfg.TaskID = taskRec.ID
+		cfg.AttemptID = attempt.ID
 
 		decisions, err := orchestrator.Run(taskCtx, cfg, t.store, t.wt)
 		if err != nil {

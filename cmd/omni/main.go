@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mhkim315/omni_orchestration/internal/coordinator"
 	"github.com/mhkim315/omni_orchestration/internal/daemon"
@@ -615,10 +616,37 @@ func fleetCmd(args []string) error {
 	tracker.ResumeActiveTasks()
 	log.Printf("fleet: tracker started with %d workers, %d tasks", maxWorkers, len(plan.Tasks))
 
-	<-ctx.Done()
-	tracker.Close()
-	log.Printf("fleet: stopped")
-	return nil
+	// v3.0.6: Poll for terminal state, exit when all done or timeout.
+	timeout := time.NewTimer(10 * time.Minute)
+	defer timeout.Stop()
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			tracker.Close()
+			log.Printf("fleet: stopped")
+			return nil
+		case <-timeout.C:
+			tracker.Close()
+			log.Printf("fleet: timeout — stopping")
+			return fmt.Errorf("fleet: timeout after 10min")
+		case <-ticker.C:
+			allTerminal := true
+			for _, tid := range taskIDs {
+				dt, err := dagStore.GetTask(tid)
+				if err != nil || (dt.Status != dag.StatusCompleted && dt.Status != dag.StatusFailed) {
+					allTerminal = false
+					break
+				}
+			}
+			if allTerminal {
+				tracker.Close()
+				log.Printf("fleet: all %d tasks terminal — stopping", len(taskIDs))
+				return nil
+			}
+		}
+	}
 }
 
 // ── Doctor subcommand (v2.2) ──
